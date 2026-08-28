@@ -1,15 +1,19 @@
 use anyhow::{Context as _, Result};
-use collections::{BTreeMap, BTreeSet, HashSet};
+use collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use ec4rs::{ConfigParser, PropertiesSource, Section};
 use fs::Fs;
 use futures::StreamExt;
-use gpui::{Context, EventEmitter, Task};
+use gpui::{AppContext as _, Context, EventEmitter, Task};
 use paths::EDITORCONFIG_NAME;
 use smallvec::SmallVec;
 use std::{path::Path, str::FromStr, sync::Arc};
 use util::{ResultExt as _, rel_path::RelPath};
 
-use crate::{InvalidSettingsError, LocalSettingsPath, WorktreeId, watch_config_file};
+use crate::{
+    InvalidSettingsError, LocalSettingsPath, SettingsStore, WorktreeId, watch_config_file,
+};
+
+const PARSE_CACHE_MAX_ENTRIES: usize = 32;
 
 pub type EditorconfigProperties = ec4rs::Properties;
 
@@ -46,15 +50,17 @@ impl EventEmitter<EditorconfigEvent> for EditorconfigStore {}
 
 #[derive(Default)]
 pub struct EditorconfigStore {
-    external_configs: BTreeMap<Arc<Path>, (String, Option<Editorconfig>)>,
+    external_configs: BTreeMap<Arc<Path>, (Arc<str>, Option<Arc<Editorconfig>>)>,
     worktree_state: BTreeMap<WorktreeId, EditorconfigWorktreeState>,
+    parse_cache: HashMap<Arc<str>, std::result::Result<Arc<Editorconfig>, String>>,
+    parse_tasks: HashMap<(WorktreeId, LocalSettingsPath), Task<()>>,
     local_external_config_watchers: BTreeMap<Arc<Path>, Task<()>>,
     local_external_config_discovery_tasks: BTreeMap<WorktreeId, Task<()>>,
 }
 
 #[derive(Default)]
 struct EditorconfigWorktreeState {
-    internal_configs: BTreeMap<Arc<RelPath>, (String, Option<Editorconfig>)>,
+    internal_configs: BTreeMap<Arc<RelPath>, (Arc<str>, Option<Arc<Editorconfig>>)>,
     external_config_paths: BTreeSet<Arc<Path>>,
 }
 
@@ -64,14 +70,17 @@ impl EditorconfigStore {
         worktree_id: WorktreeId,
         path: LocalSettingsPath,
         content: Option<&str>,
+        cx: &mut Context<Self>,
     ) -> std::result::Result<(), InvalidSettingsError> {
         match (&path, content) {
             (LocalSettingsPath::InWorktree(rel_path), None) => {
+                self.parse_tasks.remove(&(worktree_id, path.clone()));
                 if let Some(state) = self.worktree_state.get_mut(&worktree_id) {
                     state.internal_configs.remove(rel_path);
                 }
             }
             (LocalSettingsPath::OutsideWorktree(abs_path), None) => {
+                self.parse_tasks.remove(&(worktree_id, path.clone()));
                 if let Some(state) = self.worktree_state.get_mut(&worktree_id) {
                     state.external_config_paths.remove(abs_path);
                 }
@@ -85,20 +94,23 @@ impl EditorconfigStore {
                 }
             }
             (LocalSettingsPath::InWorktree(rel_path), Some(content)) => {
-                let state = self.worktree_state.entry(worktree_id).or_default();
-                let should_update = state
-                    .internal_configs
-                    .get(rel_path)
-                    .map_or(true, |entry| entry.0 != content);
-                if should_update {
-                    let parsed = match content.parse::<Editorconfig>() {
-                        Ok(parsed) => Some(parsed),
-                        Err(e) => {
-                            state
-                                .internal_configs
-                                .insert(rel_path.clone(), (content.to_owned(), None));
+                let unchanged = self
+                    .worktree_state
+                    .get(&worktree_id)
+                    .and_then(|state| state.internal_configs.get(rel_path))
+                    .is_some_and(|entry| &*entry.0 == content);
+                if !unchanged {
+                    let content: Arc<str> = Arc::from(content);
+                    if let Some(cached) = self.parse_cache.get(&content) {
+                        let cached = cached.clone();
+                        self.worktree_state
+                            .entry(worktree_id)
+                            .or_default()
+                            .internal_configs
+                            .insert(rel_path.clone(), (content, cached.as_ref().ok().cloned()));
+                        if let Err(message) = cached {
                             return Err(InvalidSettingsError::Editorconfig {
-                                message: e.to_string(),
+                                message,
                                 path: LocalSettingsPath::InWorktree(
                                     rel_path
                                         .join(RelPath::from_unix_str(EDITORCONFIG_NAME).unwrap())
@@ -106,43 +118,100 @@ impl EditorconfigStore {
                                 ),
                             });
                         }
-                    };
-                    state
-                        .internal_configs
-                        .insert(rel_path.clone(), (content.to_owned(), parsed));
+                    } else {
+                        self.worktree_state
+                            .entry(worktree_id)
+                            .or_default()
+                            .internal_configs
+                            .insert(rel_path.clone(), (content.clone(), None));
+                        self.spawn_parse(worktree_id, path.clone(), content, cx);
+                    }
                 }
             }
             (LocalSettingsPath::OutsideWorktree(abs_path), Some(content)) => {
                 let state = self.worktree_state.entry(worktree_id).or_default();
                 state.external_config_paths.insert(abs_path.clone());
-                let should_update = self
+                let unchanged = self
                     .external_configs
                     .get(abs_path)
-                    .map_or(true, |entry| entry.0 != content);
-                if should_update {
-                    let parsed = match content.parse::<Editorconfig>() {
-                        Ok(parsed) => Some(parsed),
-                        Err(e) => {
-                            self.external_configs
-                                .insert(abs_path.clone(), (content.to_owned(), None));
+                    .is_some_and(|entry| &*entry.0 == content);
+                if !unchanged {
+                    let content: Arc<str> = Arc::from(content);
+                    if let Some(cached) = self.parse_cache.get(&content) {
+                        let cached = cached.clone();
+                        self.external_configs
+                            .insert(abs_path.clone(), (content, cached.as_ref().ok().cloned()));
+                        if let Err(message) = cached {
                             return Err(InvalidSettingsError::Editorconfig {
-                                message: e.to_string(),
+                                message,
                                 path: LocalSettingsPath::OutsideWorktree(
                                     abs_path.join(EDITORCONFIG_NAME).into(),
                                 ),
                             });
                         }
-                    };
-                    self.external_configs
-                        .insert(abs_path.clone(), (content.to_owned(), parsed));
+                    } else {
+                        self.external_configs
+                            .insert(abs_path.clone(), (content.clone(), None));
+                        self.spawn_parse(worktree_id, path.clone(), content, cx);
+                    }
                 }
             }
         }
         Ok(())
     }
 
+    fn spawn_parse(
+        &mut self,
+        worktree_id: WorktreeId,
+        path: LocalSettingsPath,
+        content: Arc<str>,
+        cx: &mut Context<Self>,
+    ) {
+        let background_parse = cx.background_spawn({
+            let content = content.clone();
+            async move { content.parse::<Editorconfig>().map_err(|e| e.to_string()) }
+        });
+        let key = (worktree_id, path);
+        let task = cx.spawn({
+            let key = key.clone();
+            async move |this, cx| {
+                let parse_result = background_parse.await.map(Arc::new);
+                this.update(cx, |this, cx| {
+                    if this.parse_cache.len() >= PARSE_CACHE_MAX_ENTRIES {
+                        this.parse_cache.clear();
+                    }
+                    this.parse_cache
+                        .insert(content.clone(), parse_result.clone());
+
+                    let (worktree_id, path) = &key;
+                    if let Err(message) = &parse_result {
+                        log::error!("Failed to parse .editorconfig in {path:?}: {message}");
+                    }
+                    let entry = match path {
+                        LocalSettingsPath::InWorktree(rel_path) => this
+                            .worktree_state
+                            .get_mut(worktree_id)
+                            .and_then(|state| state.internal_configs.get_mut(rel_path)),
+                        LocalSettingsPath::OutsideWorktree(abs_path) => {
+                            this.external_configs.get_mut(abs_path)
+                        }
+                    };
+                    if let Some(entry) = entry.filter(|entry| entry.0 == content) {
+                        entry.1 = parse_result.ok();
+                        if cx.has_global::<SettingsStore>() {
+                            cx.global_mut::<SettingsStore>();
+                        }
+                    }
+                })
+                .ok();
+            }
+        });
+        self.parse_tasks.insert(key, task);
+    }
+
     pub(crate) fn remove_for_worktree(&mut self, root_id: WorktreeId) {
         self.local_external_config_discovery_tasks.remove(&root_id);
+        self.parse_tasks.retain(|(id, _), _| id != &root_id);
         let Some(removed) = self.worktree_state.remove(&root_id) else {
             return;
         };
@@ -170,7 +239,7 @@ impl EditorconfigStore {
                 state
                     .internal_configs
                     .iter()
-                    .map(|(path, data)| (path.as_ref(), data.0.as_str(), data.1.as_ref()))
+                    .map(|(path, data)| (path.as_ref(), data.0.as_ref(), data.1.as_deref()))
             })
     }
 
@@ -185,7 +254,7 @@ impl EditorconfigStore {
                 state.external_config_paths.iter().filter_map(|path| {
                     self.external_configs
                         .get(path)
-                        .map(|entry| (path.as_ref(), entry.0.as_str(), entry.1.as_ref()))
+                        .map(|entry| (path.as_ref(), entry.0.as_ref(), entry.1.as_deref()))
                 })
             })
     }
@@ -258,7 +327,7 @@ impl EditorconfigStore {
                                 {
                                     cx.emit(EditorconfigEvent::ExternalConfigChanged {
                                         path: LocalSettingsPath::OutsideWorktree(dir_path),
-                                        content: Some(existing_config.0.clone()),
+                                        content: Some(existing_config.0.to_string()),
                                         affected_worktree_ids: vec![worktree_id],
                                     });
                                 } else {
@@ -350,7 +419,7 @@ impl EditorconfigStore {
 
             for ancestor in for_path.ancestors() {
                 if let Some((_, parsed)) = state.internal_configs.get(ancestor) {
-                    let config = parsed.as_ref()?;
+                    let config = parsed.as_deref()?;
                     internal_configs.push(config);
                     if config.is_root {
                         break;
@@ -391,5 +460,99 @@ impl EditorconfigStore {
             .get(&worktree_id)
             .map(|state| state.external_config_paths.iter().cloned().collect())
             .unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ec4rs::property::IndentSize;
+    use gpui::TestAppContext;
+
+    #[gpui::test]
+    async fn test_parses_in_background(cx: &mut TestAppContext) {
+        let store = cx.new(|_| EditorconfigStore::default());
+        let worktree_id = WorktreeId::from_usize(1);
+        let root = LocalSettingsPath::InWorktree(Arc::from(RelPath::empty()));
+        let file_path = RelPath::from_unix_str("src/main.rs").unwrap();
+        let content = "root = true\n\n[*]\nindent_size = 4\n";
+
+        store.update(cx, |store, cx| {
+            store
+                .set_configs(worktree_id, root.clone(), Some(content), cx)
+                .unwrap();
+            assert!(store.properties(worktree_id, file_path).is_none());
+        });
+        cx.run_until_parked();
+
+        let properties = store
+            .read_with(cx, |store, _| store.properties(worktree_id, file_path))
+            .unwrap();
+        assert_eq!(
+            properties.get::<IndentSize>().ok(),
+            Some(IndentSize::Value(4))
+        );
+    }
+
+    #[gpui::test]
+    async fn test_parse_cache_survives_removal(cx: &mut TestAppContext) {
+        let store = cx.new(|_| EditorconfigStore::default());
+        let worktree_id = WorktreeId::from_usize(1);
+        let root = LocalSettingsPath::InWorktree(Arc::from(RelPath::empty()));
+        let file_path = RelPath::from_unix_str("src/main.rs").unwrap();
+        let content = "root = true\n\n[*]\nindent_size = 4\n";
+
+        store.update(cx, |store, cx| {
+            store
+                .set_configs(worktree_id, root.clone(), Some(content), cx)
+                .unwrap();
+        });
+        cx.run_until_parked();
+
+        store.update(cx, |store, cx| {
+            store
+                .set_configs(worktree_id, root.clone(), None, cx)
+                .unwrap();
+            let properties = store.properties(worktree_id, file_path).unwrap();
+            assert_eq!(properties.get::<IndentSize>().ok(), None);
+
+            store
+                .set_configs(worktree_id, root.clone(), Some(content), cx)
+                .unwrap();
+            let properties = store.properties(worktree_id, file_path).unwrap();
+            assert_eq!(
+                properties.get::<IndentSize>().ok(),
+                Some(IndentSize::Value(4))
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_invalid_config_error_is_cached(cx: &mut TestAppContext) {
+        let store = cx.new(|_| EditorconfigStore::default());
+        let worktree_id = WorktreeId::from_usize(1);
+        let root = LocalSettingsPath::InWorktree(Arc::from(RelPath::empty()));
+        let file_path = RelPath::from_unix_str("src/main.rs").unwrap();
+        let content = "[]\nindent_size = 4\n";
+
+        store.update(cx, |store, cx| {
+            store
+                .set_configs(worktree_id, root.clone(), Some(content), cx)
+                .unwrap();
+        });
+        cx.run_until_parked();
+
+        store.update(cx, |store, cx| {
+            assert!(store.properties(worktree_id, file_path).is_none());
+
+            store
+                .set_configs(worktree_id, root.clone(), None, cx)
+                .unwrap();
+            let error = store
+                .set_configs(worktree_id, root.clone(), Some(content), cx)
+                .unwrap_err();
+            assert!(matches!(error, InvalidSettingsError::Editorconfig { .. }));
+            assert!(store.properties(worktree_id, file_path).is_none());
+        });
     }
 }
