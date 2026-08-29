@@ -985,6 +985,14 @@ notify = { git = "https://github.com/zed-industries/notify", rev = "0890bbb8ca40
 notify-types = { git = "https://github.com/zed-industries/notify", rev = "0890bbb8ca40a4b5d1f67031698dd7918b37d991" }
 webrtc-sys = { git = "https://github.com/zed-industries/livekit-rust-sdks", rev = "0a1c519cfce9b365229026b55de9b9dbdb6fed3c" }
 
+# corgi builds `build.rs`/proc-macros in a sandbox with no write access outside
+# the action's own OUT_DIR. Stock `cxx-build` hard-fails when it can't write the
+# shared cxxbridge headers into the `scratch` crate's cross-crate directory
+# (which lives outside OUT_DIR). This fork makes those shared writes best-effort
+# and always writes the authoritative copy into OUT_DIR, so cxx still builds
+# under corgi. Temporary: track upstreaming before removing this patch.
+cxx-build = { git = "https://github.com/ConradIrwin/cxx", branch = "corgi-writable-out-dir" }
+
 [profile.dev]
 split-debuginfo = "unpacked"
 incremental = true

@@ -947,6 +947,7 @@ dependencies = [
  "anyhow",
  "gpui",
  "rust-embed",
+ "util",
 ]
 
 [[package]]
@@ -4573,8 +4574,7 @@ dependencies = [
 [[package]]
 name = "cxx-build"
 version = "1.0.187"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d74b6bcf49ebbd91f1b1875b706ea46545032a14003b5557b7dfa4bbeba6766e"
+source = "git+https://github.com/ConradIrwin/cxx?branch=corgi-writable-out-dir#ff3bf9d9f7f63c4bc16f314dbe15e55f4dca99bb"
 dependencies = [
  "cc",
  "codespan-reporting",
@@ -7844,6 +7844,7 @@ dependencies = [
  "tree-sitter-rust",
  "tree-sitter-typescript",
  "tree-sitter-yaml",
+ "util",
 ]
 
 [[package]]
