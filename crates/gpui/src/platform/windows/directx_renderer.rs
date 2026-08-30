@@ -984,6 +984,7 @@ impl DirectXGlobalElements {
 
         Ok(Self {
             global_params_buffer,
+            effect_globals_buffer,
             sampler,
         })
     }
