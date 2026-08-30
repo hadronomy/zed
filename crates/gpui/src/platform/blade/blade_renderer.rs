@@ -677,6 +677,19 @@ impl BladeRenderer {
         profiling::scope!("render pass");
         for batch in scene.batches() {
             match batch {
+                PrimitiveBatch::Effects { effect_id, effects } => {
+                    // Blade builds its pipelines from one shader at startup,
+                    // while an effect's WGSL is registered by the application
+                    // and must be compiled per effect. Until that is wired the
+                    // batch is skipped, which is what any backend does with a
+                    // shader it cannot build.
+                    if !effects.is_empty() {
+                        log::warn!(
+                            "effect {effect_id:?} was skipped: the Blade renderer has no effect \
+                             pipeline yet"
+                        );
+                    }
+                }
                 PrimitiveBatch::Quads(quads) => {
                     let instance_buf = unsafe { self.instance_belt.alloc_typed(quads, &self.gpu) };
                     let mut encoder = pass.with(&self.pipelines.quads);
