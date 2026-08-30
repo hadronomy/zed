@@ -1,6 +1,8 @@
 #[cfg(any(feature = "inspector", debug_assertions))]
 use crate::Inspector;
 use crate::{
+    effect::{self, EffectId, PARAM_COUNT},
+    scene::EffectQuad,
     Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
     AsyncWindowContext, AvailableSpace, Background, BorderStyle, Bounds, BoxShadow, Capslock,
     Context, Corners, CursorStyle, Decorations, DevicePixels, DispatchActionListener,
@@ -2827,6 +2829,34 @@ impl Window {
         }
     }
 
+    /// Paint a shader-backed rectangle into the scene for the next frame at the
+    /// current stacking context.
+    ///
+    /// The effect is clipped to the current content mask and its alpha is scaled
+    /// by the current element opacity, exactly as [`Window::paint_quad`] is. An
+    /// effect whose shader will not translate on this backend draws nothing and
+    /// logs once; [`effect::validate_all`] finds that in a test instead.
+    ///
+    /// This method should only be called as part of the paint phase of element
+    /// drawing.
+    pub fn paint_effect(&mut self, effect: PaintEffect) {
+        self.invalidator.debug_assert_paint();
+
+        let scale_factor = self.scale_factor();
+        let content_mask = self.content_mask();
+        let opacity = self.element_opacity();
+        self.next_frame.scene.insert_primitive(EffectQuad {
+            order: 0,
+            effect_id: effect.effect,
+            bounds: effect.bounds.scale(scale_factor),
+            content_mask: content_mask.scale(scale_factor),
+            corner_radii: effect.corner_radii.scale(scale_factor),
+            scale: scale_factor,
+            opacity,
+            params: effect.params,
+        });
+    }
+
     /// Paint one or more quads into the scene for the next frame at the current stacking context.
     /// Quads are colored rectangular regions with an optional background, border, and corner radius.
     /// see [`fill`], [`outline`], and [`quad`] to construct this type.
@@ -5003,8 +5033,41 @@ impl From<&'static core::panic::Location<'static>> for ElementId {
     }
 }
 
+/// A shader-backed rectangle to be rendered in the window at the given position
+/// and size. Passed as an argument to [`Window::paint_effect`].
+#[derive(Clone, Debug)]
+pub struct PaintEffect {
+    /// The bounds of the effect within the window.
+    pub bounds: Bounds<Pixels>,
+    /// The radii of the effect's corners.
+    pub corner_radii: Corners<Pixels>,
+    /// The registered effect whose fragment function colours these bounds.
+    pub effect: EffectId,
+    /// The floats the shader reads through its generated accessors.
+    pub params: [f32; PARAM_COUNT],
+}
+
+impl PaintEffect {
+    /// An effect filling `bounds` with square corners, registering its shader
+    /// on first use.
+    pub fn new<E: effect::Effect>(bounds: Bounds<Pixels>, effect: &E) -> Self {
+        Self {
+            bounds,
+            corner_radii: Corners::default(),
+            effect: effect::register(E::definition()),
+            params: effect.params(),
+        }
+    }
+
+    /// Sets the corner radii of the effect.
+    pub fn corner_radii(mut self, corner_radii: impl Into<Corners<Pixels>>) -> Self {
+        self.corner_radii = corner_radii.into();
+        self
+    }
+}
+
 /// A rectangle to be rendered in the window at the given position and size.
-/// Passed as an argument [`Window::paint_quad`].
+/// Passed as an argument to [`Window::paint_quad`].
 #[derive(Clone)]
 pub struct PaintQuad {
     /// The bounds of the quad within the window.

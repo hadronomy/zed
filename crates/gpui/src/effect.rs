@@ -1,30 +1,41 @@
 //! GPU effects, authored once in WGSL and translated for each backend.
 //!
-//! GPUI owns three renderers with three shading languages: Metal on macOS,
-//! Direct3D 11 on Windows, and Blade on Linux. Zed has said it intends to keep
-//! the first two, so an application that wants one effect cannot expect one
-//! language. It can have one *source* language: naga reads WGSL and writes MSL
-//! and HLSL, and Blade already speaks WGSL.
+//! The three renderers speak three shading languages, so an effect cannot be
+//! written once in the language a backend compiles. It can be written once in
+//! WGSL: naga translates to MSL and to HLSL, and Blade takes WGSL directly.
 //!
-//! So this module owns the translation and nothing else. It holds no pipelines,
-//! no textures and no device handles — each renderer keeps those, because only
-//! a renderer knows what a pipeline is on its platform.
+//! This module owns that translation and nothing else. Pipelines, textures and
+//! device handles stay in the renderers, because only a renderer knows what a
+//! pipeline is on its platform.
 //!
-//! An effect is a fragment function and sixteen floats:
+//! An effect is a struct and a fragment function. Derive [`Effect`] and the
+//! accessors the shader calls are generated from the field names:
 //!
-//! ```wgsl
-//! fn effect(input: EffectInput) -> vec4<f32> {
-//!     return vec4<f32>(input.uv, 0.0, param(input, 0u));
+//! ```ignore
+//! #[derive(Effect)]
+//! #[effect(name = "grain", source = "grain.wgsl")]
+//! struct Grain {
+//!     amount: f32,
 //! }
 //! ```
 //!
-//! [`PREAMBLE`] declares everything that function may read and [`EPILOGUE`]
-//! supplies the entry points around it. Together they are the ABI, and changing
-//! them recompiles every effect in every application.
+//! ```wgsl
+//! fn effect(input: EffectInput) -> vec4<f32> {
+//!     return vec4<f32>(input.uv, 0.0, amount(input));
+//! }
+//! ```
 //!
-//! Effects live in application crates, not here. This module is the mechanism.
+//! [`PREAMBLE`] declares what that function may read and [`EPILOGUE`] supplies
+//! the entry points around it. Together they are the ABI: changing either
+//! recompiles every effect in every application.
+//!
+//! Effects live in application crates. This module is the mechanism.
 
 use std::sync::{OnceLock, RwLock};
+
+// A trait and a derive of the same name, from one path, as `serde::Serialize`
+// does. `crate::Effect` is already taken by the app's deferred-work enum.
+pub use gpui_macros::Effect;
 
 use anyhow::{Context as _, Result, anyhow, bail};
 
@@ -63,6 +74,78 @@ pub struct EffectDef {
     /// The effect's own WGSL. Must define
     /// `fn effect(input: EffectInput) -> vec4<f32>`.
     pub wgsl: &'static str,
+    /// The values the shader reads, in the order the application writes them.
+    /// GPUI generates an accessor for each, so neither side spells a slot.
+    pub parameters: &'static [Parameter],
+}
+
+/// One value an effect hands its shader, and the accessor generated for it.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct Parameter {
+    /// The name of the generated accessor function.
+    pub name: &'static str,
+    /// What that accessor returns, and how many slots it occupies.
+    pub kind: ParameterKind,
+}
+
+/// What a [`Parameter`]'s generated accessor returns.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum ParameterKind {
+    /// One float; the accessor returns `f32`.
+    Scalar,
+    /// Four floats holding an [`crate::Hsla`]; the accessor returns
+    /// straight-alpha `vec4<f32>`, converted by the same code that resolves a
+    /// quad's background.
+    Color,
+}
+
+impl ParameterKind {
+    /// How many of the sixteen slots this occupies.
+    pub const fn slots(self) -> usize {
+        match self {
+            ParameterKind::Scalar => 1,
+            ParameterKind::Color => 4,
+        }
+    }
+}
+
+/// Something an application paints through a shader.
+///
+/// Derive this rather than implementing it. The derive takes the accessor names
+/// from the field names and the slot order from the field order, so the struct
+/// is the only place either is decided:
+///
+/// ```ignore
+/// #[derive(Effect)]
+/// #[effect(name = "grain", source = "grain.wgsl")]
+/// struct Grain {
+///     amount: f32,
+///     size: f32,
+/// }
+/// ```
+///
+/// The shader then reads `amount(input)` and `size(input)`. Renaming a field
+/// renames the accessor, so a shader left behind fails to translate instead of
+/// reading the wrong slot.
+pub trait Effect: 'static {
+    /// Identifies the effect in the registry and in errors. Unique and stable.
+    const NAME: &'static str;
+    /// WGSL defining `fn effect(input: EffectInput) -> vec4<f32>`.
+    const SOURCE: &'static str;
+    /// The values the shader reads, in the order [`Effect::params`] writes.
+    const PARAMETERS: &'static [Parameter];
+
+    /// The floats the shader reads, in [`Effect::PARAMETERS`] order.
+    fn params(&self) -> [f32; PARAM_COUNT];
+
+    /// The registry entry for this effect.
+    fn definition() -> EffectDef {
+        EffectDef {
+            name: Self::NAME,
+            wgsl: Self::SOURCE,
+            parameters: Self::PARAMETERS,
+        }
+    }
 }
 
 /// The shading language a backend compiles.
@@ -105,6 +188,29 @@ pub mod slots {
     pub const HLSL_INSTANCES_REGISTER: u32 = 1;
 }
 
+/// Frame-wide data the shader reads. Mirrors `EffectGlobals` in the preamble.
+#[derive(Copy, Clone, Debug, Default)]
+#[repr(C)]
+pub struct EffectGlobals {
+    /// The drawable size in device pixels.
+    pub viewport_size: [f32; 2],
+    /// Non-zero when the surface wants premultiplied colour. Negotiated per
+    /// platform, so the epilogue asks rather than assuming.
+    pub premultiplied_alpha: u32,
+    _pad: u32,
+}
+
+impl EffectGlobals {
+    /// Build the globals for one frame.
+    pub fn new(viewport_size: [f32; 2], premultiplied_alpha: bool) -> Self {
+        Self {
+            viewport_size,
+            premultiplied_alpha: premultiplied_alpha as u32,
+            _pad: 0,
+        }
+    }
+}
+
 /// Per-instance data the shader reads. Mirrors `EffectInstance` in the preamble.
 ///
 /// `#[repr(C)]` with no implicit padding: every field is 8- or 16-byte aligned
@@ -126,7 +232,11 @@ pub struct EffectInstance {
     pub corner_radii: [f32; 4],
     /// Device pixels per logical pixel.
     pub scale: f32,
-    _pad: [f32; 3],
+    /// The element opacity in force when the effect was painted. Applied by the
+    /// epilogue rather than by the effect, so an effect cannot forget it or
+    /// apply it twice.
+    pub opacity: f32,
+    _pad: [f32; 2],
     /// The application's sixteen floats.
     pub params: [f32; PARAM_COUNT],
 }
@@ -141,6 +251,7 @@ impl EffectInstance {
         clip_size: [f32; 2],
         corner_radii: [f32; 4],
         scale: f32,
+        opacity: f32,
         params: [f32; PARAM_COUNT],
     ) -> Self {
         Self {
@@ -150,7 +261,8 @@ impl EffectInstance {
             clip_size,
             corner_radii,
             scale,
-            _pad: [0.0; 3],
+            opacity,
+            _pad: [0.0; 2],
             params,
         }
     }
@@ -236,10 +348,48 @@ pub fn registered() -> Vec<(EffectId, EffectDef)> {
 /// The complete WGSL module for an effect: preamble, the effect, entry points.
 pub fn module_source(def: &EffectDef) -> String {
     format!(
-        "{PREAMBLE}\n// ---- {name} ----\n{wgsl}\n// ---- entry points ----\n{EPILOGUE}",
+        "{PREAMBLE}\n{accessors}\n// ---- {name} ----\n{wgsl}\n// ---- entry points ----\n{EPILOGUE}",
+        accessors = accessors(def),
         name = def.name,
         wgsl = def.wgsl,
     )
+}
+
+/// One WGSL accessor per declared parameter, so the shader names its inputs.
+///
+/// Generating the shader-side declaration from the Rust side is what GPUI
+/// already does for its own primitives, where `build.rs` runs cbindgen over the
+/// scene types into `scene.h`. This is the same trade at the level of an
+/// application's parameters.
+fn accessors(def: &EffectDef) -> String {
+    let mut source = String::new();
+    let mut slot = 0;
+    for parameter in def.parameters {
+        let name = parameter.name;
+        match parameter.kind {
+            ParameterKind::Scalar => source.push_str(&format!(
+                "fn {name}(input: EffectInput) -> f32 {{ return param(input, {slot}u); }}\n"
+            )),
+            ParameterKind::Color => source.push_str(&format!(
+                "fn {name}(input: EffectInput) -> vec4<f32> {{ return hsla_to_rgba(Hsla(\
+                 param(input, {slot}u), param(input, {h}u), param(input, {l}u), \
+                 param(input, {a}u))); }}\n",
+                h = slot + 1,
+                l = slot + 2,
+                a = slot + 3,
+            )),
+        }
+        slot += parameter.kind.slots();
+    }
+    source
+}
+
+/// How many of the sixteen slots a definition's parameters occupy.
+fn slots_used(def: &EffectDef) -> usize {
+    def.parameters
+        .iter()
+        .map(|parameter| parameter.kind.slots())
+        .sum()
 }
 
 /// Translate an effect into what a backend compiles.
@@ -248,6 +398,13 @@ pub fn module_source(def: &EffectDef) -> String {
 /// says "line 214" is useless, because line 214 is in the preamble for every
 /// effect in the application.
 pub fn translate(def: &EffectDef, target: ShaderTarget) -> Result<String> {
+    let slots = slots_used(def);
+    if slots > PARAM_COUNT {
+        bail!(
+            "effect `{}` needs {slots} parameter slots, but the limit is {PARAM_COUNT}",
+            def.name
+        );
+    }
     let source = module_source(def);
     let module = naga::front::wgsl::parse_str(&source).map_err(|error| {
         anyhow!(

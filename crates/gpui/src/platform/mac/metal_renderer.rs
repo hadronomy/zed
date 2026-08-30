@@ -2,7 +2,11 @@ use super::metal_atlas::MetalAtlas;
 use crate::{
     AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, MonochromeSprite, PaintSurface,
     Path, Point, PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene, Shadow, Size,
-    Surface, Underline, point, size,
+    Surface, Underline,
+    effect::{self, EffectGlobals, EffectId, EffectInstance, ShaderTarget},
+    point,
+    scene::EffectQuad,
+    size,
 };
 use anyhow::Result;
 use block::ConcreteBlock;
@@ -25,7 +29,13 @@ use metal::{
 use objc::{self, msg_send, sel, sel_impl};
 use parking_lot::Mutex;
 
-use std::{cell::Cell, ffi::c_void, mem, ptr, sync::Arc};
+use collections::FxHashMap;
+use std::{
+    cell::{Cell, RefCell},
+    ffi::c_void,
+    mem, ptr,
+    sync::Arc,
+};
 
 // Exported to metal
 pub(crate) type PointF = crate::Point<f32>;
@@ -114,6 +124,10 @@ pub(crate) struct MetalRenderer {
     instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
     sprite_atlas: Arc<MetalAtlas>,
     core_video_texture_cache: core_video::metal_texture_cache::CVMetalTextureCache,
+    // Built on first use and kept for the process. `None` records a shader
+    // that would not translate or compile, so it is reported once rather than
+    // every frame it is painted.
+    effect_pipeline_states: RefCell<FxHashMap<EffectId, Option<metal::RenderPipelineState>>>,
     path_intermediate_texture: Option<metal::Texture>,
     path_intermediate_msaa_texture: Option<metal::Texture>,
     path_sample_count: u32,
@@ -271,6 +285,7 @@ impl MetalRenderer {
             instance_buffer_pool,
             sprite_atlas,
             core_video_texture_cache,
+            effect_pipeline_states: RefCell::default(),
             path_intermediate_texture: None,
             path_intermediate_msaa_texture: None,
             path_sample_count: PATH_SAMPLE_COUNT,
@@ -449,6 +464,14 @@ impl MetalRenderer {
                 ),
                 PrimitiveBatch::Quads(quads) => self.draw_quads(
                     quads,
+                    instance_buffer,
+                    &mut instance_offset,
+                    viewport_size,
+                    command_encoder,
+                ),
+                PrimitiveBatch::Effects { effect_id, effects } => self.draw_effects(
+                    effect_id,
+                    effects,
                     instance_buffer,
                     &mut instance_offset,
                     viewport_size,
@@ -691,6 +714,131 @@ impl MetalRenderer {
             0,
             6,
             shadows.len() as u64,
+        );
+        *instance_offset = next_offset;
+        true
+    }
+
+    fn effect_pipeline_state(&self, effect_id: EffectId) -> Option<metal::RenderPipelineState> {
+        if let Some(state) = self.effect_pipeline_states.borrow().get(&effect_id) {
+            return state.clone();
+        }
+        let state = self.build_effect_pipeline_state(effect_id);
+        self.effect_pipeline_states
+            .borrow_mut()
+            .insert(effect_id, state.clone());
+        state
+    }
+
+    fn build_effect_pipeline_state(
+        &self,
+        effect_id: EffectId,
+    ) -> Option<metal::RenderPipelineState> {
+        let definition = effect::definition(effect_id)?;
+        let source = match effect::translate(&definition, ShaderTarget::Msl) {
+            Ok(source) => source,
+            Err(error) => {
+                log::error!("effect `{}` did not translate: {error:#}", definition.name);
+                return None;
+            }
+        };
+        let library = match self
+            .device
+            .new_library_with_source(&source, &metal::CompileOptions::new())
+        {
+            Ok(library) => library,
+            Err(error) => {
+                log::error!("effect `{}` did not compile: {error}", definition.name);
+                return None;
+            }
+        };
+        Some(build_pipeline_state(
+            &self.device,
+            &library,
+            definition.name,
+            effect::VERTEX_ENTRY,
+            effect::FRAGMENT_ENTRY,
+            MTLPixelFormat::BGRA8Unorm,
+        ))
+    }
+
+    fn draw_effects(
+        &self,
+        effect_id: EffectId,
+        effects: &[EffectQuad],
+        instance_buffer: &mut InstanceBuffer,
+        instance_offset: &mut usize,
+        viewport_size: Size<DevicePixels>,
+        command_encoder: &metal::RenderCommandEncoderRef,
+    ) -> bool {
+        if effects.is_empty() {
+            return true;
+        }
+        // A shader that will not build is a missing rectangle, not a failed
+        // frame, so the batch is skipped and the rest of the scene draws.
+        let Some(pipeline_state) = self.effect_pipeline_state(effect_id) else {
+            return true;
+        };
+        align_offset(instance_offset);
+
+        command_encoder.set_render_pipeline_state(&pipeline_state);
+
+        // The Metal layer blends straight alpha, so the epilogue must not
+        // premultiply.
+        let globals = EffectGlobals::new(
+            [viewport_size.width.0 as f32, viewport_size.height.0 as f32],
+            false,
+        );
+        for slot in [effect::slots::MSL_GLOBALS_BUFFER as u64] {
+            command_encoder.set_vertex_bytes(
+                slot,
+                mem::size_of_val(&globals) as u64,
+                &globals as *const EffectGlobals as *const _,
+            );
+            command_encoder.set_fragment_bytes(
+                slot,
+                mem::size_of_val(&globals) as u64,
+                &globals as *const EffectGlobals as *const _,
+            );
+        }
+
+        let instances_len = mem::size_of::<EffectInstance>() * effects.len();
+        let next_offset = *instance_offset + instances_len;
+        if next_offset > instance_buffer.size {
+            return false;
+        }
+
+        command_encoder.set_vertex_buffer(
+            effect::slots::MSL_INSTANCES_BUFFER as u64,
+            Some(&instance_buffer.metal_buffer),
+            *instance_offset as u64,
+        );
+        command_encoder.set_fragment_buffer(
+            effect::slots::MSL_INSTANCES_BUFFER as u64,
+            Some(&instance_buffer.metal_buffer),
+            *instance_offset as u64,
+        );
+
+        // `EffectQuad` is not the GPU layout, so each instance is converted
+        // rather than the slice being copied wholesale.
+        let buffer_contents = unsafe {
+            (instance_buffer.metal_buffer.contents() as *mut u8).add(*instance_offset)
+                as *mut EffectInstance
+        };
+        for (index, effect) in effects.iter().enumerate() {
+            // SAFETY: `next_offset` was checked against the buffer size above,
+            // and `align_offset` left the destination 256-byte aligned.
+            unsafe { ptr::write(buffer_contents.add(index), effect.instance()) };
+        }
+
+        // Four vertices as a strip, because the epilogue derives the unit
+        // vertex from `vertex_index & 1` and `& 2` rather than reading the
+        // shared unit-vertex buffer the stock pipelines bind.
+        command_encoder.draw_primitives_instanced(
+            metal::MTLPrimitiveType::TriangleStrip,
+            0,
+            4,
+            effects.len() as u64,
         );
         *instance_offset = next_offset;
         true

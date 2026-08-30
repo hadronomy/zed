@@ -5,6 +5,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    effect::{EffectId, EffectInstance, PARAM_COUNT},
     AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, Edges, Hsla, Pixels,
     Point, Radians, ScaledPixels, Size, bounds_tree::BoundsTree, point,
 };
@@ -27,6 +28,7 @@ pub(crate) struct Scene {
     layer_stack: Vec<DrawOrder>,
     pub(crate) shadows: Vec<Shadow>,
     pub(crate) quads: Vec<Quad>,
+    pub(crate) effects: Vec<EffectQuad>,
     pub(crate) paths: Vec<Path<ScaledPixels>>,
     pub(crate) underlines: Vec<Underline>,
     pub(crate) monochrome_sprites: Vec<MonochromeSprite>,
@@ -42,6 +44,7 @@ impl Scene {
         self.paths.clear();
         self.shadows.clear();
         self.quads.clear();
+        self.effects.clear();
         self.underlines.clear();
         self.monochrome_sprites.clear();
         self.polychrome_sprites.clear();
@@ -88,6 +91,10 @@ impl Scene {
                 quad.order = order;
                 self.quads.push(quad.clone());
             }
+            Primitive::Effect(effect) => {
+                effect.order = order;
+                self.effects.push(effect.clone());
+            }
             Primitive::Path(path) => {
                 path.order = order;
                 path.id = PathId(self.paths.len());
@@ -127,6 +134,9 @@ impl Scene {
     pub fn finish(&mut self) {
         self.shadows.sort_by_key(|shadow| shadow.order);
         self.quads.sort_by_key(|quad| quad.order);
+        // Secondary key on the effect, so one pipeline serves a whole run.
+        self.effects
+            .sort_by_key(|effect| (effect.order, effect.effect_id));
         self.paths.sort_by_key(|path| path.order);
         self.underlines.sort_by_key(|underline| underline.order);
         self.monochrome_sprites
@@ -151,6 +161,9 @@ impl Scene {
             quads: &self.quads,
             quads_start: 0,
             quads_iter: self.quads.iter().peekable(),
+            effects: &self.effects,
+            effects_start: 0,
+            effects_iter: self.effects.iter().peekable(),
             paths: &self.paths,
             paths_start: 0,
             paths_iter: self.paths.iter().peekable(),
@@ -182,6 +195,9 @@ pub(crate) enum PrimitiveKind {
     Shadow,
     #[default]
     Quad,
+    // After `Quad` so that within one layer an effect covers a background fill
+    // and still sits under text.
+    Effect,
     Path,
     Underline,
     MonochromeSprite,
@@ -199,6 +215,7 @@ pub(crate) enum PaintOperation {
 pub(crate) enum Primitive {
     Shadow(Shadow),
     Quad(Quad),
+    Effect(EffectQuad),
     Path(Path<ScaledPixels>),
     Underline(Underline),
     MonochromeSprite(MonochromeSprite),
@@ -211,6 +228,7 @@ impl Primitive {
         match self {
             Primitive::Shadow(shadow) => &shadow.bounds,
             Primitive::Quad(quad) => &quad.bounds,
+            Primitive::Effect(effect) => &effect.bounds,
             Primitive::Path(path) => &path.bounds,
             Primitive::Underline(underline) => &underline.bounds,
             Primitive::MonochromeSprite(sprite) => &sprite.bounds,
@@ -223,6 +241,7 @@ impl Primitive {
         match self {
             Primitive::Shadow(shadow) => &shadow.content_mask,
             Primitive::Quad(quad) => &quad.content_mask,
+            Primitive::Effect(effect) => &effect.content_mask,
             Primitive::Path(path) => &path.content_mask,
             Primitive::Underline(underline) => &underline.content_mask,
             Primitive::MonochromeSprite(sprite) => &sprite.content_mask,
@@ -246,6 +265,9 @@ struct BatchIterator<'a> {
     quads: &'a [Quad],
     quads_start: usize,
     quads_iter: Peekable<slice::Iter<'a, Quad>>,
+    effects: &'a [EffectQuad],
+    effects_start: usize,
+    effects_iter: Peekable<slice::Iter<'a, EffectQuad>>,
     paths: &'a [Path<ScaledPixels>],
     paths_start: usize,
     paths_iter: Peekable<slice::Iter<'a, Path<ScaledPixels>>>,
@@ -273,6 +295,10 @@ impl<'a> Iterator for BatchIterator<'a> {
                 PrimitiveKind::Shadow,
             ),
             (self.quads_iter.peek().map(|q| q.order), PrimitiveKind::Quad),
+            (
+                self.effects_iter.peek().map(|effect| effect.order),
+                PrimitiveKind::Effect,
+            ),
             (self.paths_iter.peek().map(|q| q.order), PrimitiveKind::Path),
             (
                 self.underlines_iter.peek().map(|u| u.order),
@@ -362,6 +388,30 @@ impl<'a> Iterator for BatchIterator<'a> {
                     &self.underlines[underlines_start..underlines_end],
                 ))
             }
+            PrimitiveKind::Effect => {
+                // `?` rather than the neighbours' `unwrap`: the kind was chosen
+                // because this iterator peeked `Some`, so ending iteration here
+                // is both impossible and the right answer if it ever happens.
+                let effect_id = self.effects_iter.peek()?.effect_id;
+                let effects_start = self.effects_start;
+                let mut effects_end = effects_start + 1;
+                self.effects_iter.next();
+                while self
+                    .effects_iter
+                    .next_if(|effect| {
+                        (effect.order, batch_kind) < max_order_and_kind
+                            && effect.effect_id == effect_id
+                    })
+                    .is_some()
+                {
+                    effects_end += 1;
+                }
+                self.effects_start = effects_end;
+                Some(PrimitiveBatch::Effects {
+                    effect_id,
+                    effects: &self.effects[effects_start..effects_end],
+                })
+            }
             PrimitiveKind::MonochromeSprite => {
                 let texture_id = self.monochrome_sprites_iter.peek().unwrap().tile.texture_id;
                 let sprites_start = self.monochrome_sprites_start;
@@ -435,6 +485,10 @@ impl<'a> Iterator for BatchIterator<'a> {
 pub(crate) enum PrimitiveBatch<'a> {
     Shadows(&'a [Shadow]),
     Quads(&'a [Quad]),
+    Effects {
+        effect_id: EffectId,
+        effects: &'a [EffectQuad],
+    },
     Paths(&'a [Path<ScaledPixels>]),
     Underlines(&'a [Underline]),
     MonochromeSprites {
@@ -459,6 +513,53 @@ pub(crate) struct Quad {
     pub border_color: Hsla,
     pub corner_radii: Corners<ScaledPixels>,
     pub border_widths: Edges<ScaledPixels>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct EffectQuad {
+    pub order: DrawOrder,
+    pub effect_id: EffectId,
+    pub bounds: Bounds<ScaledPixels>,
+    pub content_mask: ContentMask<ScaledPixels>,
+    pub corner_radii: Corners<ScaledPixels>,
+    pub scale: f32,
+    pub opacity: f32,
+    pub params: [f32; PARAM_COUNT],
+}
+
+// Unlike its neighbours this is not `#[repr(C)]`: it is never uploaded. The
+// renderers convert it to `EffectInstance`, which keeps the GPU layout in the
+// one place `shader_instance_size` checks.
+impl EffectQuad {
+    pub(crate) fn instance(&self) -> EffectInstance {
+        EffectInstance::new(
+            [self.bounds.origin.x.0, self.bounds.origin.y.0],
+            [self.bounds.size.width.0, self.bounds.size.height.0],
+            [
+                self.content_mask.bounds.origin.x.0,
+                self.content_mask.bounds.origin.y.0,
+            ],
+            [
+                self.content_mask.bounds.size.width.0,
+                self.content_mask.bounds.size.height.0,
+            ],
+            [
+                self.corner_radii.top_left.0,
+                self.corner_radii.top_right.0,
+                self.corner_radii.bottom_right.0,
+                self.corner_radii.bottom_left.0,
+            ],
+            self.scale,
+            self.opacity,
+            self.params,
+        )
+    }
+}
+
+impl From<EffectQuad> for Primitive {
+    fn from(effect: EffectQuad) -> Self {
+        Primitive::Effect(effect)
+    }
 }
 
 impl From<Quad> for Primitive {

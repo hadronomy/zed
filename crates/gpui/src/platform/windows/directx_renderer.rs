@@ -19,10 +19,16 @@ use windows::{
     core::Interface,
 };
 
+use collections::FxHashMap;
+use windows::Win32::Graphics::Direct3D::{D3D_FEATURE_LEVEL_11_0, ID3DBlob};
+use windows::core::PCSTR;
+
 use crate::{
+    effect::{self, EffectGlobals, EffectId, EffectInstance},
     platform::windows::directx_renderer::shader_resources::{
         RawShaderBytes, ShaderModule, ShaderTarget,
     },
+    scene::EffectQuad,
     *,
 };
 
@@ -45,6 +51,11 @@ pub(crate) struct DirectXRenderer {
     pipelines: DirectXRenderPipelines,
     direct_composition: Option<DirectComposition>,
     font_info: &'static FontInfo,
+    // Built on first use and kept for the process. `None` records a shader that
+    // would not translate or compile, so it is reported once rather than every
+    // frame it is painted.
+    effect_pipelines: FxHashMap<EffectId, Option<PipelineState<EffectInstance>>>,
+    effect_instances: Vec<EffectInstance>,
 }
 
 /// Direct3D objects
@@ -87,6 +98,9 @@ struct DirectXRenderPipelines {
 
 struct DirectXGlobalElements {
     global_params_buffer: [Option<ID3D11Buffer>; 1],
+    // Effects declare their own globals, whose layout differs from
+    // `GlobalParams`, so they cannot share its buffer.
+    effect_globals_buffer: [Option<ID3D11Buffer>; 1],
     sampler: [Option<ID3D11SamplerState>; 1],
 }
 
@@ -164,6 +178,8 @@ impl DirectXRenderer {
             pipelines,
             direct_composition,
             font_info: Self::get_font_info(),
+            effect_pipelines: FxHashMap::default(),
+            effect_instances: Vec::new(),
         })
     }
 
@@ -184,6 +200,19 @@ impl DirectXRenderer {
                 grayscale_enhanced_contrast: self.font_info.grayscale_enhanced_contrast,
                 _pad: 0,
             }],
+        )?;
+        update_buffer(
+            &self.devices.device_context,
+            self.globals.effect_globals_buffer[0].as_ref().unwrap(),
+            &[EffectGlobals::new(
+                [
+                    self.resources.viewport[0].Width,
+                    self.resources.viewport[0].Height,
+                ],
+                // The swap chain blends straight alpha, so the epilogue must
+                // not premultiply.
+                false,
+            )],
         )?;
         unsafe {
             self.devices.device_context.ClearRenderTargetView(
@@ -292,6 +321,9 @@ impl DirectXRenderer {
                 PrimitiveBatch::Paths(paths) => {
                     self.draw_paths_to_intermediate(paths)?;
                     self.draw_paths_from_intermediate(paths)
+                }
+                PrimitiveBatch::Effects { effect_id, effects } => {
+                    self.draw_effects(effect_id, effects)
                 }
                 PrimitiveBatch::Underlines(underlines) => self.draw_underlines(underlines),
                 PrimitiveBatch::MonochromeSprites {
@@ -500,6 +532,101 @@ impl DirectXRenderer {
             &self.globals.sampler,
             sprites.len() as u32,
         )
+    }
+
+    fn draw_effects(&mut self, effect_id: EffectId, effects: &[EffectQuad]) -> Result<()> {
+        if effects.is_empty() {
+            return Ok(());
+        }
+        // A shader that will not build is a missing rectangle, not a failed
+        // frame, so the batch is skipped and the rest of the scene draws.
+        if !self.ensure_effect_pipeline(effect_id) {
+            return Ok(());
+        }
+
+        self.effect_instances.clear();
+        self.effect_instances
+            .extend(effects.iter().map(EffectQuad::instance));
+
+        let Some(Some(pipeline)) = self.effect_pipelines.get_mut(&effect_id) else {
+            return Ok(());
+        };
+        pipeline.update_buffer(
+            &self.devices.device,
+            &self.devices.device_context,
+            &self.effect_instances,
+        )?;
+        pipeline.draw(
+            &self.devices.device_context,
+            &self.resources.viewport,
+            &self.globals.effect_globals_buffer,
+            D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP,
+            4,
+            effects.len() as u32,
+        )
+    }
+
+    /// Build the pipeline for an effect if it is not built yet, reporting a
+    /// failure once rather than every frame the effect is painted.
+    fn ensure_effect_pipeline(&mut self, effect_id: EffectId) -> bool {
+        if let Some(pipeline) = self.effect_pipelines.get(&effect_id) {
+            return pipeline.is_some();
+        }
+        let pipeline = self.build_effect_pipeline(effect_id);
+        let built = pipeline.is_some();
+        self.effect_pipelines.insert(effect_id, pipeline);
+        built
+    }
+
+    fn build_effect_pipeline(
+        &self,
+        effect_id: EffectId,
+    ) -> Option<PipelineState<EffectInstance>> {
+        let definition = effect::definition(effect_id)?;
+
+        // naga's HLSL floor is Shader Model 5.0, which needs feature level
+        // 11.0. GPUI still supports 10.1 hardware, where an effect simply does
+        // not draw.
+        let feature_level = unsafe { self.devices.device.GetFeatureLevel() };
+        if feature_level.0 < D3D_FEATURE_LEVEL_11_0.0 {
+            log::warn!(
+                "effect `{}` needs Direct3D feature level 11.0; this device is {feature_level:?}",
+                definition.name
+            );
+            return None;
+        }
+
+        let source = match effect::translate(&definition, effect::ShaderTarget::Hlsl) {
+            Ok(source) => source,
+            Err(error) => {
+                log::error!("effect `{}` did not translate: {error:#}", definition.name);
+                return None;
+            }
+        };
+        let vertex = compile_effect_shader(&source, definition.name, effect::VERTEX_ENTRY, "vs_5_0")
+            .log_err()?;
+        let fragment =
+            compile_effect_shader(&source, definition.name, effect::FRAGMENT_ENTRY, "ps_5_0")
+                .log_err()?;
+        PipelineState::from_shaders(
+            &self.devices.device,
+            definition.name,
+            unsafe {
+                std::slice::from_raw_parts(
+                    vertex.GetBufferPointer() as *const u8,
+                    vertex.GetBufferSize(),
+                )
+            },
+            unsafe {
+                std::slice::from_raw_parts(
+                    fragment.GetBufferPointer() as *const u8,
+                    fragment.GetBufferSize(),
+                )
+            },
+            16,
+            create_blend_state(&self.devices.device).log_err()?,
+        )
+        .log_err()
     }
 
     fn draw_underlines(&mut self, underlines: &[Underline]) -> Result<()> {
@@ -824,6 +951,18 @@ impl DirectXGlobalElements {
             device.CreateBuffer(&desc, None, Some(&mut buffer))?;
             [buffer]
         };
+        let effect_globals_buffer = unsafe {
+            let desc = D3D11_BUFFER_DESC {
+                ByteWidth: std::mem::size_of::<EffectGlobals>() as u32,
+                Usage: D3D11_USAGE_DYNAMIC,
+                BindFlags: D3D11_BIND_CONSTANT_BUFFER.0 as u32,
+                CPUAccessFlags: D3D11_CPU_ACCESS_WRITE.0 as u32,
+                ..Default::default()
+            };
+            let mut buffer = None;
+            device.CreateBuffer(&desc, None, Some(&mut buffer))?;
+            [buffer]
+        };
 
         let sampler = unsafe {
             let desc = D3D11_SAMPLER_DESC {
@@ -878,14 +1017,30 @@ impl<T> PipelineState<T> {
         buffer_size: usize,
         blend_state: ID3D11BlendState,
     ) -> Result<Self> {
-        let vertex = {
-            let raw_shader = RawShaderBytes::new(shader_module, ShaderTarget::Vertex)?;
-            create_vertex_shader(device, raw_shader.as_bytes())?
-        };
-        let fragment = {
-            let raw_shader = RawShaderBytes::new(shader_module, ShaderTarget::Fragment)?;
-            create_fragment_shader(device, raw_shader.as_bytes())?
-        };
+        let vertex = RawShaderBytes::new(shader_module, ShaderTarget::Vertex)?;
+        let fragment = RawShaderBytes::new(shader_module, ShaderTarget::Fragment)?;
+        Self::from_shaders(
+            device,
+            label,
+            vertex.as_bytes(),
+            fragment.as_bytes(),
+            buffer_size,
+            blend_state,
+        )
+    }
+
+    /// Build a pipeline from shader bytecode rather than from a compiled-in
+    /// module, which is how a runtime-registered effect arrives.
+    fn from_shaders(
+        device: &ID3D11Device,
+        label: &'static str,
+        vertex_bytes: &[u8],
+        fragment_bytes: &[u8],
+        buffer_size: usize,
+        blend_state: ID3D11BlendState,
+    ) -> Result<Self> {
+        let vertex = create_vertex_shader(device, vertex_bytes)?;
+        let fragment = create_fragment_shader(device, fragment_bytes)?;
         let buffer = create_buffer(device, std::mem::size_of::<T>(), buffer_size)?;
         let view = create_buffer_view(device, &buffer)?;
 
@@ -1310,6 +1465,49 @@ fn create_fragment_shader(device: &ID3D11Device, bytes: &[u8]) -> Result<ID3D11P
 }
 
 #[inline]
+/// Compile a translated effect's HLSL. Runtime compilation is the only route
+/// for an effect, because the shader is registered by the application rather
+/// than compiled into the binary by `build.rs`.
+fn compile_effect_shader(
+    source: &str,
+    name: &str,
+    entry: &str,
+    profile: &str,
+) -> Result<ID3DBlob> {
+    use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+
+    let entry = std::ffi::CString::new(entry)?;
+    let profile = std::ffi::CString::new(profile)?;
+    let mut code = None;
+    let mut errors = None;
+    let result = unsafe {
+        D3DCompile(
+            source.as_ptr() as *const std::ffi::c_void,
+            source.len(),
+            None,
+            None,
+            None,
+            PCSTR::from_raw(entry.as_ptr() as *const u8),
+            PCSTR::from_raw(profile.as_ptr() as *const u8),
+            0,
+            0,
+            &mut code,
+            Some(&mut errors),
+        )
+    };
+    if result.is_err() {
+        let detail = errors
+            .map(|errors| unsafe {
+                std::ffi::CStr::from_ptr(errors.GetBufferPointer() as *const i8)
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .unwrap_or_else(|| format!("{result:?}"));
+        anyhow::bail!("effect `{name}` did not compile: {detail}");
+    }
+    code.context("D3DCompile reported success without producing bytecode")
+}
+
 fn create_buffer(
     device: &ID3D11Device,
     element_size: usize,

@@ -16,11 +16,11 @@ struct EffectInstance {
     clip_origin: vec2<f32>,
     clip_size: vec2<f32>,
     corner_radii: vec4<f32>,
-    // `.x` is device pixels per logical pixel; the other three lanes are
-    // reserved. A bare `f32` here would be a trap: WGSL aligns the `vec3` that
-    // would have to follow it to 16 bytes, so the shader and the Rust struct
-    // would disagree about the offset of every field after this one, and the
-    // effect would read parameters out of the padding.
+    // `.x` is device pixels per logical pixel, `.y` is element opacity, and
+    // `.zw` are reserved. A bare `f32` here would be a trap: WGSL aligns the
+    // `vec3` that would have to follow it to 16 bytes, so the shader and the
+    // Rust struct would disagree about the offset of every field after this
+    // one, and the effect would read parameters out of the padding.
     scale: vec4<f32>,
     params0: vec4<f32>,
     params1: vec4<f32>,
@@ -68,14 +68,48 @@ fn param(input: EffectInput, index: u32) -> f32 {
     return row.w;
 }
 
-/// Four consecutive floats as a colour.
-fn param_rgba(input: EffectInput, index: u32) -> vec4<f32> {
-    return vec4<f32>(
-        param(input, index),
-        param(input, index + 1u),
-        param(input, index + 2u),
-        param(input, index + 3u),
-    );
+struct Hsla {
+    h: f32,
+    s: f32,
+    l: f32,
+    a: f32,
+}
+
+// Copied from GPUI's own shaders so a colour parameter and a quad's background
+// resolve identically. A colour parameter reaches the shader as an Hsla,
+// because that is what GPUI's Rust side holds.
+fn hsla_to_rgba(hsla: Hsla) -> vec4<f32> {
+    let h = hsla.h * 6.0;
+    let s = hsla.s;
+    let l = hsla.l;
+    let a = hsla.a;
+
+    let c = (1.0 - abs(2.0 * l - 1.0)) * s;
+    let x = c * (1.0 - abs(h % 2.0 - 1.0));
+    let m = l - c / 2.0;
+    var color = vec3<f32>(m);
+
+    if (h >= 0.0 && h < 1.0) {
+        color.r += c;
+        color.g += x;
+    } else if (h >= 1.0 && h < 2.0) {
+        color.r += x;
+        color.g += c;
+    } else if (h >= 2.0 && h < 3.0) {
+        color.g += c;
+        color.b += x;
+    } else if (h >= 3.0 && h < 4.0) {
+        color.g += x;
+        color.b += c;
+    } else if (h >= 4.0 && h < 5.0) {
+        color.r += x;
+        color.b += c;
+    } else {
+        color.r += c;
+        color.b += x;
+    }
+
+    return vec4<f32>(color, a);
 }
 
 // The render targets are BGRA8 UNORM on every backend we drive, so GPUI blends

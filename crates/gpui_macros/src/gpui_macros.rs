@@ -1,5 +1,6 @@
 mod derive_action;
 mod derive_app_context;
+mod derive_effect;
 mod derive_into_element;
 mod derive_render;
 mod derive_visual_context;
@@ -32,6 +33,14 @@ pub fn register_action(ident: TokenStream) -> TokenStream {
 #[proc_macro_derive(IntoElement)]
 pub fn derive_into_element(input: TokenStream) -> TokenStream {
     derive_into_element::derive_into_element(input)
+}
+
+/// `Effect` derive macro - see the trait documentation for details. The accessor
+/// names come from the field names and the slot order from the field order, so
+/// neither the shader nor the application spells a slot number.
+#[proc_macro_derive(Effect, attributes(effect))]
+pub fn derive_effect(input: TokenStream) -> TokenStream {
+    derive_effect::derive_effect(input)
 }
 
 #[proc_macro_derive(Render)]

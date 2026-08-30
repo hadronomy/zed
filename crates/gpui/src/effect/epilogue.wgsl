@@ -92,7 +92,7 @@ fn fs_effect(raster: EffectRaster) -> @location(0) vec4<f32> {
     let distance = effect_quad_sdf(raster.local, instance.bounds_size, instance.corner_radii);
     let coverage = saturate(0.5 - distance);
 
-    let alpha = color.a * coverage;
+    let alpha = color.a * coverage * instance.scale.y;
     let multiplier = select(1.0, alpha, effect_globals.premultiplied_alpha != 0u);
     return vec4<f32>(color.rgb * multiplier, alpha);
 }
