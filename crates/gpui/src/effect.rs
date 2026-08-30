@@ -1,0 +1,394 @@
+//! GPU effects, authored once in WGSL and translated for each backend.
+//!
+//! GPUI owns three renderers with three shading languages: Metal on macOS,
+//! Direct3D 11 on Windows, and Blade on Linux. Zed has said it intends to keep
+//! the first two, so an application that wants one effect cannot expect one
+//! language. It can have one *source* language: naga reads WGSL and writes MSL
+//! and HLSL, and Blade already speaks WGSL.
+//!
+//! So this module owns the translation and nothing else. It holds no pipelines,
+//! no textures and no device handles — each renderer keeps those, because only
+//! a renderer knows what a pipeline is on its platform.
+//!
+//! An effect is a fragment function and sixteen floats:
+//!
+//! ```wgsl
+//! fn effect(input: EffectInput) -> vec4<f32> {
+//!     return vec4<f32>(input.uv, 0.0, param(input, 0u));
+//! }
+//! ```
+//!
+//! [`PREAMBLE`] declares everything that function may read and [`EPILOGUE`]
+//! supplies the entry points around it. Together they are the ABI, and changing
+//! them recompiles every effect in every application.
+//!
+//! Effects live in application crates, not here. This module is the mechanism.
+
+use std::sync::{OnceLock, RwLock};
+
+use anyhow::{Context as _, Result, anyhow, bail};
+
+/// Declarations an effect may use. Prepended to every effect module.
+pub const PREAMBLE: &str = include_str!("effect/preamble.wgsl");
+
+/// Entry points wrapping the effect's own function. Appended to every module.
+pub const EPILOGUE: &str = include_str!("effect/epilogue.wgsl");
+
+/// Vertex entry point that [`EPILOGUE`] defines.
+pub const VERTEX_ENTRY: &str = "vs_effect";
+
+/// Fragment entry point that [`EPILOGUE`] defines.
+pub const FRAGMENT_ENTRY: &str = "fs_effect";
+
+/// How many floats an effect can hand its shader.
+///
+/// Sixteen is a colour, a rectangle, and a few parameters. An effect that wants
+/// more is telling us it should be two effects.
+pub const PARAM_COUNT: usize = 16;
+
+/// A registered effect.
+///
+/// Cheap to copy and stable for the life of the process, so a renderer can hold
+/// one across frames without borrowing the registry.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Default)]
+#[repr(transparent)]
+pub struct EffectId(pub u32);
+
+/// An effect's name and source, as the application registered it.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct EffectDef {
+    /// Identifies the effect in errors, in GPU debug labels, and in the
+    /// registry. Must be unique and stable.
+    pub name: &'static str,
+    /// The effect's own WGSL. Must define
+    /// `fn effect(input: EffectInput) -> vec4<f32>`.
+    pub wgsl: &'static str,
+}
+
+/// The shading language a backend compiles.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum ShaderTarget {
+    /// Blade, which compiles WGSL itself.
+    Wgsl,
+    /// Metal Shading Language.
+    Msl,
+    /// High Level Shading Language at Shader Model 5.0, which is what Direct3D
+    /// 11 accepts. This is the floor: an effect that needs wave intrinsics
+    /// compiles on the other two backends and fails here.
+    Hlsl,
+}
+
+/// Resource slots the generated module uses, and which each renderer must bind.
+///
+/// These are one set of numbers shared by three backends. If a renderer binds a
+/// different slot than the translation targets, the effect draws garbage rather
+/// than failing, so the two are stated once, here, and referenced from both
+/// sides.
+pub mod slots {
+    /// Bind group holding the globals and the instance buffer.
+    pub const GROUP: u32 = 0;
+    /// `EffectGlobals`, a uniform buffer.
+    pub const GLOBALS: u32 = 0;
+    /// `array<EffectInstance>`, a read-only storage buffer.
+    pub const INSTANCES: u32 = 1;
+
+    /// Metal buffer index for the globals.
+    pub const MSL_GLOBALS_BUFFER: u8 = 0;
+    /// Metal buffer index for the instances.
+    pub const MSL_INSTANCES_BUFFER: u8 = 1;
+
+    /// HLSL `cbuffer` register for the globals: `register(b0)`.
+    pub const HLSL_GLOBALS_REGISTER: u32 = 0;
+    /// HLSL `StructuredBuffer` register for the instances: `register(t1)`.
+    /// Slot 1, because the stock GPUI pipelines keep `t0` for a texture and the
+    /// effect pipelines will want it for the same reason.
+    pub const HLSL_INSTANCES_REGISTER: u32 = 1;
+}
+
+/// Per-instance data the shader reads. Mirrors `EffectInstance` in the preamble.
+///
+/// `#[repr(C)]` with no implicit padding: every field is 8- or 16-byte aligned
+/// by construction, because this is memcpy'd into a GPU buffer and a padding
+/// byte read as data is undefined behaviour on the CPU side and a wrong pixel on
+/// the GPU side.
+#[derive(Copy, Clone, Debug, Default)]
+#[repr(C)]
+pub struct EffectInstance {
+    /// Top-left of the element, in device pixels.
+    pub bounds_origin: [f32; 2],
+    /// Element size, in device pixels.
+    pub bounds_size: [f32; 2],
+    /// Content mask origin, in device pixels.
+    pub clip_origin: [f32; 2],
+    /// Content mask size, in device pixels.
+    pub clip_size: [f32; 2],
+    /// Top-left, top-right, bottom-right, bottom-left, in device pixels.
+    pub corner_radii: [f32; 4],
+    /// Device pixels per logical pixel.
+    pub scale: f32,
+    _pad: [f32; 3],
+    /// The application's sixteen floats.
+    pub params: [f32; PARAM_COUNT],
+}
+
+impl EffectInstance {
+    /// Build an instance. The padding stays private so it cannot be filled with
+    /// something a future field would collide with.
+    pub fn new(
+        bounds_origin: [f32; 2],
+        bounds_size: [f32; 2],
+        clip_origin: [f32; 2],
+        clip_size: [f32; 2],
+        corner_radii: [f32; 4],
+        scale: f32,
+        params: [f32; PARAM_COUNT],
+    ) -> Self {
+        Self {
+            bounds_origin,
+            bounds_size,
+            clip_origin,
+            clip_size,
+            corner_radii,
+            scale,
+            _pad: [0.0; 3],
+            params,
+        }
+    }
+}
+
+static REGISTRY: OnceLock<RwLock<Vec<EffectDef>>> = OnceLock::new();
+
+fn registry() -> &'static RwLock<Vec<EffectDef>> {
+    REGISTRY.get_or_init(|| RwLock::new(Vec::new()))
+}
+
+/// Register an effect and get a handle to it.
+///
+/// Registering the same name twice returns the first handle rather than adding a
+/// second entry, so a test that registers an application's whole catalogue can
+/// run beside an application that already did.
+///
+/// Registration does not compile anything. Use [`validate_all`] in a test to
+/// find a broken shader before a frame does.
+pub fn register(def: EffectDef) -> EffectId {
+    // Element code calls this on every paint to turn a type into a handle, so
+    // the already-registered path takes a read lock and the write lock is only
+    // reached once per effect in the life of the process.
+    if let Some(id) = lookup(def.name) {
+        return id;
+    }
+    let mut effects = registry().write().unwrap();
+    if let Some(index) = effects.iter().position(|existing| existing.name == def.name) {
+        return EffectId(index as u32);
+    }
+    effects.push(def);
+    EffectId((effects.len() - 1) as u32)
+}
+
+/// The handle for an effect that is already registered.
+pub fn lookup(name: &str) -> Option<EffectId> {
+    registry()
+        .read()
+        .unwrap()
+        .iter()
+        .position(|existing| existing.name == name)
+        .map(|index| EffectId(index as u32))
+}
+
+/// The definition behind a handle.
+pub fn definition(id: EffectId) -> Option<EffectDef> {
+    registry().read().unwrap().get(id.0 as usize).copied()
+}
+
+/// The size the shader believes [`EffectInstance`] is, in bytes.
+///
+/// Asks naga rather than trusting a comment. WGSL and Rust apply different
+/// alignment rules — `vec3<f32>` aligns to 16 in one and 4 in the other — so the
+/// two structs can drift apart without either side failing to compile. The
+/// symptom is an effect reading its parameters out of padding, which looks like
+/// a broken shader rather than a broken struct.
+pub fn shader_instance_size() -> Result<u32> {
+    let module = naga::front::wgsl::parse_str(PREAMBLE)
+        .map_err(|error| anyhow!("the preamble is not valid WGSL:\n{}", error.emit_to_string(PREAMBLE)))?;
+    let mut layouter = naga::proc::Layouter::default();
+    layouter
+        .update(module.to_ctx())
+        .context("laying out the preamble's types")?;
+    for (handle, ty) in module.types.iter() {
+        if ty.name.as_deref() == Some("EffectInstance") {
+            return Ok(layouter[handle].size);
+        }
+    }
+    bail!("the preamble declares no `EffectInstance`")
+}
+
+/// Every registered effect, in registration order.
+pub fn registered() -> Vec<(EffectId, EffectDef)> {
+    registry()
+        .read()
+        .unwrap()
+        .iter()
+        .enumerate()
+        .map(|(index, def)| (EffectId(index as u32), *def))
+        .collect()
+}
+
+/// The complete WGSL module for an effect: preamble, the effect, entry points.
+pub fn module_source(def: &EffectDef) -> String {
+    format!(
+        "{PREAMBLE}\n// ---- {name} ----\n{wgsl}\n// ---- entry points ----\n{EPILOGUE}",
+        name = def.name,
+        wgsl = def.wgsl,
+    )
+}
+
+/// Translate an effect into what a backend compiles.
+///
+/// Errors carry the effect's name and naga's message. A shader error that only
+/// says "line 214" is useless, because line 214 is in the preamble for every
+/// effect in the application.
+pub fn translate(def: &EffectDef, target: ShaderTarget) -> Result<String> {
+    let source = module_source(def);
+    let module = naga::front::wgsl::parse_str(&source).map_err(|error| {
+        anyhow!(
+            "effect `{}` is not valid WGSL:\n{}",
+            def.name,
+            error.emit_to_string(&source)
+        )
+    })?;
+
+    let info = naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::empty(),
+    )
+    .validate(&module)
+    .map_err(|error| {
+        anyhow!(
+            "effect `{}` did not validate:\n{}",
+            def.name,
+            error.emit_to_string(&source)
+        )
+    })?;
+
+    match target {
+        ShaderTarget::Wgsl => {
+            naga::back::wgsl::write_string(&module, &info, naga::back::wgsl::WriterFlags::empty())
+                .with_context(|| format!("writing WGSL for effect `{}`", def.name))
+        }
+        ShaderTarget::Msl => write_msl(def, &module, &info),
+        ShaderTarget::Hlsl => write_hlsl(def, &module, &info),
+    }
+}
+
+fn resource(binding: u32) -> naga::ResourceBinding {
+    naga::ResourceBinding {
+        group: slots::GROUP,
+        binding,
+    }
+}
+
+fn write_msl(
+    def: &EffectDef,
+    module: &naga::Module,
+    info: &naga::valid::ModuleInfo,
+) -> Result<String> {
+    use naga::back::msl;
+
+    let mut resources = msl::BindingMap::default();
+    resources.insert(
+        resource(slots::GLOBALS),
+        msl::BindTarget {
+            buffer: Some(slots::MSL_GLOBALS_BUFFER),
+            ..Default::default()
+        },
+    );
+    resources.insert(
+        resource(slots::INSTANCES),
+        msl::BindTarget {
+            buffer: Some(slots::MSL_INSTANCES_BUFFER),
+            ..Default::default()
+        },
+    );
+
+    let entry_point_resources = msl::EntryPointResources {
+        resources,
+        ..Default::default()
+    };
+    let mut per_entry_point_map = msl::EntryPointResourceMap::default();
+    for entry in [VERTEX_ENTRY, FRAGMENT_ENTRY] {
+        per_entry_point_map.insert(entry.to_string(), entry_point_resources.clone());
+    }
+
+    let options = msl::Options {
+        // naga defaults to MSL 1.0, which has no `instance_id` attribute, so
+        // the instanced quad every effect draws will not translate. 2.1 ships
+        // with macOS 10.14 and is older than anything GPUI runs on.
+        lang_version: (2, 1),
+        per_entry_point_map,
+        ..Default::default()
+    };
+    let (source, _) = msl::write_string(module, info, &options, &Default::default())
+        .with_context(|| format!("writing Metal shader for effect `{}`", def.name))?;
+    Ok(source)
+}
+
+fn write_hlsl(
+    def: &EffectDef,
+    module: &naga::Module,
+    info: &naga::valid::ModuleInfo,
+) -> Result<String> {
+    use naga::back::hlsl;
+
+    let mut binding_map = hlsl::BindingMap::default();
+    binding_map.insert(
+        resource(slots::GLOBALS),
+        hlsl::BindTarget {
+            space: 0,
+            register: slots::HLSL_GLOBALS_REGISTER,
+            ..Default::default()
+        },
+    );
+    binding_map.insert(
+        resource(slots::INSTANCES),
+        hlsl::BindTarget {
+            space: 0,
+            register: slots::HLSL_INSTANCES_REGISTER,
+            ..Default::default()
+        },
+    );
+
+    let options = hlsl::Options {
+        // Direct3D 11 is the floor. Targeting anything higher would let an
+        // effect compile here and fail on Windows.
+        shader_model: hlsl::ShaderModel::V5_0,
+        binding_map,
+        ..Default::default()
+    };
+
+    let mut source = String::new();
+    let mut writer = hlsl::Writer::new(&mut source, &options);
+    writer
+        .write(module, info, None)
+        .with_context(|| format!("writing HLSL for effect `{}`", def.name))?;
+    Ok(source)
+}
+
+/// Translate every registered effect for every backend.
+///
+/// Call this from a test. A shader that fails to translate is a black rectangle
+/// on a customer's machine and a stack trace nowhere, so the only good place to
+/// find out is `cargo test`, on any platform, for all three backends at once.
+pub fn validate_all() -> Result<()> {
+    let mut failures = Vec::new();
+    for (_, def) in registered() {
+        for target in [ShaderTarget::Wgsl, ShaderTarget::Msl, ShaderTarget::Hlsl] {
+            if let Err(error) = translate(&def, target) {
+                failures.push(format!("{:?}: {error:#}", target));
+            }
+        }
+    }
+    if !failures.is_empty() {
+        bail!("{} effect translations failed:\n{}", failures.len(), failures.join("\n\n"));
+    }
+    Ok(())
+}

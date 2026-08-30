@@ -19,6 +19,7 @@ mod color;
 pub mod colors;
 mod element;
 mod elements;
+pub mod effect;
 mod executor;
 mod geometry;
 mod global;
