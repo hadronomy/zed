@@ -682,7 +682,9 @@ impl BladeRenderer {
                     // while an effect's WGSL is registered by the application
                     // and must be compiled per effect. Until that is wired the
                     // batch is skipped, which is what any backend does with a
-                    // shader it cannot build.
+                    // shader it cannot build. A captured subtree's content is
+                    // lost here as well, because nothing walks `scene.captures`
+                    // on this backend yet.
                     if !effects.is_empty() {
                         log::warn!(
                             "effect {effect_id:?} was skipped: the Blade renderer has no effect \

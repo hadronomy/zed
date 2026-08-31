@@ -314,6 +314,17 @@ impl DirectXRenderer {
 
     pub(crate) fn draw(&mut self, scene: &Scene) -> Result<()> {
         self.pre_draw()?;
+        // Until captures resolve to their own targets here, their content is
+        // drawn straight into the frame. The effect is lost; the content is not,
+        // which is the right way round for a backend that is behind.
+        for capture in &scene.captures {
+            self.draw_scene(&capture.scene)?;
+        }
+        self.draw_scene(scene)?;
+        self.present()
+    }
+
+    fn draw_scene(&mut self, scene: &Scene) -> Result<()> {
         for batch in scene.batches() {
             match batch {
                 PrimitiveBatch::Shadows(shadows) => self.draw_shadows(shadows),
@@ -344,7 +355,7 @@ impl DirectXRenderer {
                     scene.polychrome_sprites.len(),
                     scene.surfaces.len(),))?;
         }
-        self.present()
+        Ok(())
     }
 
     pub(crate) fn resize(&mut self, new_size: Size<DevicePixels>) -> Result<()> {
