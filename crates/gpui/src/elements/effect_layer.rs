@@ -14,6 +14,7 @@ pub fn effect_layer<E: effect::Effect>(effect: &E, child: impl IntoElement) -> E
     EffectLayer {
         effect: effect::register(E::definition()),
         params: effect.params(),
+        outset: Pixels::ZERO,
         corner_radii: Corners::default(),
         child: child.into_any_element(),
     }
@@ -23,11 +24,19 @@ pub fn effect_layer<E: effect::Effect>(effect: &E, child: impl IntoElement) -> E
 pub struct EffectLayer {
     effect: EffectId,
     params: [f32; PARAM_COUNT],
+    outset: Pixels,
     corner_radii: Corners<Pixels>,
     child: AnyElement,
 }
 
 impl EffectLayer {
+    /// Give the effect room to spread past the child, without moving the
+    /// child's neighbours. See [`PaintEffect::outset`].
+    pub fn outset(mut self, outset: Pixels) -> Self {
+        self.outset = outset;
+        self
+    }
+
     /// Round the composited result, the way a quad's corners round.
     pub fn corner_radii(mut self, corner_radii: impl Into<Corners<Pixels>>) -> Self {
         self.corner_radii = corner_radii.into();
@@ -89,6 +98,7 @@ impl Element for EffectLayer {
     ) {
         let effect = PaintEffect {
             bounds,
+            outset: self.outset,
             corner_radii: self.corner_radii,
             effect: self.effect,
             params: self.params,

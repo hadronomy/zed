@@ -2849,7 +2849,7 @@ impl Window {
             order: 0,
             effect_id: effect.effect,
             source: None,
-            bounds: effect.bounds.scale(scale_factor),
+            bounds: effect.bounds.dilate(effect.outset).scale(scale_factor),
             content_mask: content_mask.scale(scale_factor),
             corner_radii: effect.corner_radii.scale(scale_factor),
             scale: scale_factor,
@@ -2864,8 +2864,15 @@ impl Window {
     ///
     /// The content becomes its own stacking context, the way a CSS `filter`
     /// makes one: ordering inside it is independent of the surrounding scene.
-    /// Text inside renders with grayscale anti-aliasing, because subpixel
-    /// coverage cannot be composited over a texture whose backdrop is unknown.
+    /// [`PaintEffect::outset`] decides how much of the surrounding area comes
+    /// with it, which is what an effect that spreads has to read from.
+    ///
+    /// Two things behave differently inside than out. Content that leaves the
+    /// capture's bounds is gone rather than clipped, because the capture is the
+    /// texture and there is nothing past its edge. And translucent content
+    /// stacked on more translucent content composites slightly too opaque,
+    /// because GPUI accumulates destination alpha additively — free on an
+    /// opaque window, visible here.
     ///
     /// A backend without an effect pipeline draws the content unchanged rather
     /// than dropping it.
@@ -2882,7 +2889,11 @@ impl Window {
         let scale_factor = self.scale_factor();
         let content_mask = self.content_mask();
         let opacity = self.element_opacity();
-        let bounds = effect.bounds.scale(scale_factor);
+        // One rectangle for both halves. The capture is resolved at these
+        // bounds and the quad composites at them, so `uv` spans the same area
+        // on each side and an effect can read at the coordinate it is shading
+        // without knowing an outset was applied at all.
+        let bounds = effect.bounds.dilate(effect.outset).scale(scale_factor);
 
         // The content paints into a scene of its own, which is what makes the
         // capture a stacking context rather than a slice of the parent's order.
@@ -5089,6 +5100,8 @@ impl From<&'static core::panic::Location<'static>> for ElementId {
 pub struct PaintEffect {
     /// The bounds of the effect within the window.
     pub bounds: Bounds<Pixels>,
+    /// How far past [`PaintEffect::bounds`] the effect draws, and reads.
+    pub outset: Pixels,
     /// The radii of the effect's corners.
     pub corner_radii: Corners<Pixels>,
     /// The registered effect whose fragment function colours these bounds.
@@ -5103,10 +5116,33 @@ impl PaintEffect {
     pub fn new<E: effect::Effect>(bounds: Bounds<Pixels>, effect: &E) -> Self {
         Self {
             bounds,
+            outset: Pixels::ZERO,
             corner_radii: Corners::default(),
             effect: effect::register(E::definition()),
             params: effect.params(),
         }
+    }
+
+    /// Grow the effect past its bounds on every side, without moving anything
+    /// around it.
+    ///
+    /// An effect that spreads — a blur, a glow — needs somewhere to spread to,
+    /// and needs to have been given the content just outside its element to
+    /// spread from. Both are this one number: the capture grows by it, so the
+    /// content is there to read, and the composited rectangle grows by it, so
+    /// there is room to put the result.
+    ///
+    /// Layout does not see it. The element occupies what it always did and its
+    /// neighbours do not move, exactly as a CSS `filter` leaves the box alone
+    /// and paints outside it.
+    ///
+    /// Set it to the distance the shader actually reaches. Too little clips the
+    /// spread at the element's edge, which is the artefact this exists to
+    /// remove; too much costs the area of the extra ring, in a texture and in
+    /// fill.
+    pub fn outset(mut self, outset: Pixels) -> Self {
+        self.outset = outset;
+        self
     }
 
     /// Sets the corner radii of the effect.
