@@ -744,10 +744,10 @@ impl DirectXRenderer {
                 return None;
             }
         };
-        let vertex = compile_effect_shader(&source, definition.name, effect::VERTEX_ENTRY, "vs_5_0")
+        let vertex = effect::compile_hlsl(&source, definition.name, effect::VERTEX_ENTRY, "vs_5_0")
             .log_err()?;
         let fragment =
-            compile_effect_shader(&source, definition.name, effect::FRAGMENT_ENTRY, "ps_5_0")
+            effect::compile_hlsl(&source, definition.name, effect::FRAGMENT_ENTRY, "ps_5_0")
                 .log_err()?;
         PipelineState::from_shaders(
             &self.devices.device,
@@ -1632,46 +1632,6 @@ fn create_fragment_shader(device: &ID3D11Device, bytes: &[u8]) -> Result<ID3D11P
 /// Compile a translated effect's HLSL. Runtime compilation is the only route
 /// for an effect, because the shader is registered by the application rather
 /// than compiled into the binary by `build.rs`.
-fn compile_effect_shader(
-    source: &str,
-    name: &str,
-    entry: &str,
-    profile: &str,
-) -> Result<ID3DBlob> {
-    use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
-
-    let entry = std::ffi::CString::new(entry)?;
-    let profile = std::ffi::CString::new(profile)?;
-    let mut code = None;
-    let mut errors = None;
-    let result = unsafe {
-        D3DCompile(
-            source.as_ptr() as *const std::ffi::c_void,
-            source.len(),
-            None,
-            None,
-            None,
-            PCSTR::from_raw(entry.as_ptr() as *const u8),
-            PCSTR::from_raw(profile.as_ptr() as *const u8),
-            0,
-            0,
-            &mut code,
-            Some(&mut errors),
-        )
-    };
-    if result.is_err() {
-        let detail = errors
-            .map(|errors| unsafe {
-                std::ffi::CStr::from_ptr(errors.GetBufferPointer() as *const i8)
-                    .to_string_lossy()
-                    .into_owned()
-            })
-            .unwrap_or_else(|| format!("{result:?}"));
-        anyhow::bail!("effect `{name}` did not compile: {detail}");
-    }
-    code.context("D3DCompile reported success without producing bytecode")
-}
-
 fn create_buffer(
     device: &ID3D11Device,
     element_size: usize,

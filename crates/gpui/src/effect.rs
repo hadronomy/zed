@@ -662,6 +662,92 @@ fn flatten_sampler_heap(source: &mut String, name: &str) -> Result<()> {
 /// The variable naga names its standard sampler heap.
 const SAMPLER_HEAP: &str = "nagaSamplerHeap";
 
+/// Compile one entry point the way the Direct3D renderer will.
+///
+/// Lives here rather than in the renderer because it is a statement about the
+/// ABI, not about a device: it needs no adapter, no swap chain and no window,
+/// which is exactly what lets a test call it.
+#[cfg(windows)]
+pub fn compile_hlsl(
+    source: &str,
+    name: &str,
+    entry: &str,
+    profile: &str,
+) -> Result<windows::Win32::Graphics::Direct3D::ID3DBlob> {
+    use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+    use windows::core::PCSTR;
+
+    let entry = std::ffi::CString::new(entry)?;
+    let profile = std::ffi::CString::new(profile)?;
+    let mut code = None;
+    let mut errors = None;
+    let result = unsafe {
+        D3DCompile(
+            source.as_ptr() as *const std::ffi::c_void,
+            source.len(),
+            None,
+            None,
+            None,
+            PCSTR::from_raw(entry.as_ptr() as *const u8),
+            PCSTR::from_raw(profile.as_ptr() as *const u8),
+            0,
+            0,
+            &mut code,
+            Some(&mut errors),
+        )
+    };
+    if result.is_err() {
+        let detail = errors
+            .map(|errors| unsafe {
+                std::ffi::CStr::from_ptr(errors.GetBufferPointer() as *const i8)
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .unwrap_or_else(|| format!("{result:?}"));
+        bail!("effect `{name}` did not compile: {detail}");
+    }
+    code.context("D3DCompile reported success without producing bytecode")
+}
+
+/// Translate an effect and put it through fxc, as building a pipeline would.
+///
+/// [`translate`] proves naga emits HLSL. It cannot prove fxc accepts it, and
+/// the two disagree often enough to matter — a register space, a resource
+/// limit, an intrinsic that Shader Model 5.0 does not have. That disagreement
+/// surfaces at pipeline creation, on a customer's machine, as a logged line and
+/// a rectangle that never draws.
+///
+/// This is the same compiler call the renderer makes, so a pass here means the
+/// renderer will get bytecode too.
+#[cfg(windows)]
+pub fn validate_direct3d(def: &EffectDef) -> Result<()> {
+    let source = translate(def, ShaderTarget::Hlsl)?;
+    for (entry, profile) in [(VERTEX_ENTRY, "vs_5_0"), (FRAGMENT_ENTRY, "ps_5_0")] {
+        compile_hlsl(&source, def.name, entry, profile)
+            .with_context(|| format!("compiling `{entry}` for effect `{}`", def.name))?;
+    }
+    Ok(())
+}
+
+/// Put every registered effect through fxc. See [`validate_direct3d`].
+#[cfg(windows)]
+pub fn validate_all_direct3d() -> Result<()> {
+    let mut failures = Vec::new();
+    for (_, def) in registered() {
+        if let Err(error) = validate_direct3d(&def) {
+            failures.push(format!("{error:#}"));
+        }
+    }
+    if !failures.is_empty() {
+        bail!(
+            "{} effects were rejected by fxc:\n{}",
+            failures.len(),
+            failures.join("\n\n")
+        );
+    }
+    Ok(())
+}
+
 /// Translate every registered effect for every backend.
 ///
 /// Call this from a test. A shader that fails to translate is a black rectangle
@@ -739,6 +825,15 @@ mod tests {
             !source.contains("border_color::opaque"),
             "the inline sampler reads an opaque border outside the capture:\n{source}"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn fxc_accepts_the_abi() {
+        // The rest of the HLSL tests read naga's output as text. This one hands
+        // it to the compiler that actually decides, which is the only thing
+        // that can tell a black rectangle from a working effect.
+        validate_direct3d(&PROBE).unwrap();
     }
 
     #[test]
