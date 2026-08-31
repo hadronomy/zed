@@ -53,9 +53,9 @@ pub const FRAGMENT_ENTRY: &str = "fs_effect";
 
 /// How many floats an effect can hand its shader.
 ///
-/// Sixteen is a colour, a rectangle, and a few parameters. An effect that wants
-/// more is telling us it should be two effects.
-pub const PARAM_COUNT: usize = 16;
+/// Six rows of four. An effect that wants more than this is telling us it should
+/// be two effects.
+pub const PARAM_COUNT: usize = 24;
 
 /// A registered effect.
 ///
@@ -237,7 +237,7 @@ pub struct EffectInstance {
     /// apply it twice.
     pub opacity: f32,
     _pad: [f32; 2],
-    /// The application's sixteen floats.
+    /// The application's floats.
     pub params: [f32; PARAM_COUNT],
 }
 

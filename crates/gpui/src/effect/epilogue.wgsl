@@ -83,6 +83,8 @@ fn fs_effect(raster: EffectRaster) -> @location(0) vec4<f32> {
     input.params1 = instance.params1;
     input.params2 = instance.params2;
     input.params3 = instance.params3;
+    input.params4 = instance.params4;
+    input.params5 = instance.params5;
 
     let color = effect(input);
 

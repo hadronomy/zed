@@ -26,6 +26,8 @@ struct EffectInstance {
     params1: vec4<f32>,
     params2: vec4<f32>,
     params3: vec4<f32>,
+    params4: vec4<f32>,
+    params5: vec4<f32>,
 }
 
 @group(0) @binding(0) var<uniform> effect_globals: EffectGlobals;
@@ -46,20 +48,26 @@ struct EffectInput {
     params1: vec4<f32>,
     params2: vec4<f32>,
     params3: vec4<f32>,
+    params4: vec4<f32>,
+    params5: vec4<f32>,
 }
 
-/// The sixteen floats the application packed, by index.
+/// The floats the application packed, by index.
 ///
 /// Indices run 0..16. Anything higher reads the last float rather than
 /// trapping, because a shader is not the place to discover an off-by-one.
 fn param(input: EffectInput, index: u32) -> f32 {
-    var row = input.params3;
+    var row = input.params5;
     if index < 4u {
         row = input.params0;
     } else if index < 8u {
         row = input.params1;
     } else if index < 12u {
         row = input.params2;
+    } else if index < 16u {
+        row = input.params3;
+    } else if index < 20u {
+        row = input.params4;
     }
     let lane = index & 3u;
     if lane == 0u { return row.x; }
