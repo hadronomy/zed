@@ -72,8 +72,10 @@ impl Scene {
     /// Record a subtree's scene and return the handle an effect composites it
     /// with.
     pub fn push_capture(&mut self, bounds: Bounds<ScaledPixels>, scene: Scene) -> CaptureId {
+        // The handle is the position, so a renderer resolving captures in order
+        // can index straight into what it produced.
         let id = CaptureId(self.captures.len() as u32);
-        self.captures.push(Capture { id, bounds, scene });
+        self.captures.push(Capture { bounds, scene });
         id
     }
 
@@ -532,7 +534,6 @@ pub(crate) struct Quad {
 /// in the same way a CSS `filter` is: ordering inside it is independent of the
 /// parent's.
 pub(crate) struct Capture {
-    pub id: CaptureId,
     /// The element's bounds grown by the effect's outsets, which is the region
     /// the renderer resolves to a texture.
     pub bounds: Bounds<ScaledPixels>,

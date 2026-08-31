@@ -128,6 +128,16 @@ pub(crate) struct MetalRenderer {
     // that would not translate or compile, so it is reported once rather than
     // every frame it is painted.
     effect_pipeline_states: RefCell<FxHashMap<EffectId, Option<metal::RenderPipelineState>>>,
+    // Free list of capture targets, matched by exact size. A capture's size
+    // changes only when its element does, so this hits on nearly every frame.
+    // Shared and locked because targets are returned from the command buffer's
+    // completion handler, which runs on whichever thread Metal chooses.
+    #[allow(clippy::arc_with_non_send_sync)]
+    capture_textures: Arc<Mutex<Vec<metal::Texture>>>,
+    // Bound where a capture would be, for an effect that paints its own pixels.
+    // An effect that reads `source()` outside a layer then gets a defined blank
+    // rather than whichever texture happened to be bound last.
+    blank_texture: metal::Texture,
     path_intermediate_texture: Option<metal::Texture>,
     path_intermediate_msaa_texture: Option<metal::Texture>,
     path_sample_count: u32,
@@ -268,6 +278,15 @@ impl MetalRenderer {
         let core_video_texture_cache =
             CVMetalTextureCache::new(None, device.clone(), None).unwrap();
 
+        let blank_texture = {
+            let descriptor = metal::TextureDescriptor::new();
+            descriptor.set_width(1);
+            descriptor.set_height(1);
+            descriptor.set_pixel_format(metal::MTLPixelFormat::BGRA8Unorm);
+            descriptor.set_usage(metal::MTLTextureUsage::ShaderRead);
+            device.new_texture(&descriptor)
+        };
+
         Self {
             device,
             layer,
@@ -286,6 +305,8 @@ impl MetalRenderer {
             sprite_atlas,
             core_video_texture_cache,
             effect_pipeline_states: RefCell::default(),
+            capture_textures: Arc::default(),
+            blank_texture,
             path_intermediate_texture: None,
             path_intermediate_msaa_texture: None,
             path_sample_count: PATH_SAMPLE_COUNT,
@@ -389,12 +410,20 @@ impl MetalRenderer {
                 self.draw_primitives(scene, &mut instance_buffer, drawable, viewport_size);
 
             match command_buffer {
-                Ok(command_buffer) => {
+                Ok((command_buffer, captures)) => {
                     let instance_buffer_pool = self.instance_buffer_pool.clone();
                     let instance_buffer = Cell::new(Some(instance_buffer));
+                    // Capture targets go back to the pool only once the GPU has
+                    // finished reading them, which is what the completion
+                    // handler is for.
+                    let capture_textures = self.capture_textures.clone();
+                    let captures = Cell::new(Some(captures));
                     let block = ConcreteBlock::new(move |_| {
                         if let Some(instance_buffer) = instance_buffer.take() {
                             instance_buffer_pool.lock().release(instance_buffer);
+                        }
+                        if let Some(captures) = captures.take() {
+                            capture_textures.lock().extend(captures);
                         }
                     });
                     let block = block.copy();
@@ -437,20 +466,140 @@ impl MetalRenderer {
         instance_buffer: &mut InstanceBuffer,
         drawable: &metal::MetalDrawableRef,
         viewport_size: Size<DevicePixels>,
-    ) -> Result<metal::CommandBuffer> {
+    ) -> Result<(metal::CommandBuffer, Vec<metal::Texture>)> {
         let command_queue = self.command_queue.clone();
         let command_buffer = command_queue.new_command_buffer();
         let alpha = if self.layer.is_opaque() { 1. } else { 0. };
         let mut instance_offset = 0;
 
-        let mut command_encoder = new_command_encoder(
-            command_buffer,
-            drawable,
+        // Captures resolve first and deepest first, because compositing one
+        // reads the texture it was drawn into.
+        // Every target created this frame, at any depth, so all of them go back
+        // to the pool together once the GPU is done.
+        let mut retired = Vec::new();
+        let captures = self.render_captures(
+            scene,
+            instance_buffer,
+            &mut instance_offset,
             viewport_size,
+            command_buffer,
+            &mut retired,
+        )?;
+
+        self.draw_scene(
+            scene,
+            &captures,
+            instance_buffer,
+            &mut instance_offset,
+            drawable.texture(),
+            point(ScaledPixels(0.), ScaledPixels(0.)),
+            viewport_size,
+            command_buffer,
             |color_attachment| {
                 color_attachment.set_load_action(metal::MTLLoadAction::Clear);
                 color_attachment.set_clear_color(metal::MTLClearColor::new(0., 0., 0., alpha));
             },
+        )?;
+
+        instance_buffer.metal_buffer.did_modify_range(NSRange {
+            location: 0,
+            length: instance_offset as NSUInteger,
+        });
+        retired.extend(captures);
+        Ok((command_buffer.to_owned(), retired))
+    }
+
+    /// Draw every capture in `scene` into a texture of its own, innermost
+    /// first, and return them indexed by `CaptureId`.
+    fn render_captures(
+        &mut self,
+        scene: &Scene,
+        instance_buffer: &mut InstanceBuffer,
+        instance_offset: &mut usize,
+        viewport_size: Size<DevicePixels>,
+        command_buffer: &metal::CommandBufferRef,
+        retired: &mut Vec<metal::Texture>,
+    ) -> Result<Vec<metal::Texture>> {
+        if scene.captures.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut textures = Vec::with_capacity(scene.captures.len());
+        for capture in &scene.captures {
+            let nested = self.render_captures(
+                &capture.scene,
+                instance_buffer,
+                instance_offset,
+                viewport_size,
+                command_buffer,
+                retired,
+            )?;
+            let texture = self.capture_texture(capture.bounds.size);
+            self.draw_scene(
+                &capture.scene,
+                &nested,
+                instance_buffer,
+                instance_offset,
+                &texture,
+                capture.bounds.origin,
+                viewport_size,
+                command_buffer,
+                |color_attachment| {
+                    color_attachment.set_load_action(metal::MTLLoadAction::Clear);
+                    color_attachment.set_clear_color(metal::MTLClearColor::new(0., 0., 0., 0.));
+                },
+            )?;
+            textures.push(texture);
+            retired.extend(nested);
+        }
+        Ok(textures)
+    }
+
+    /// A texture to resolve one capture into, reused across frames.
+    ///
+    /// Sized to the capture rather than to the window: a floating panel is a
+    /// small fraction of the drawable, and a full-screen target per capture
+    /// would cost tens of megabytes each.
+    fn capture_texture(&self, size: Size<ScaledPixels>) -> metal::Texture {
+        let width = (size.width.0.ceil() as u64).max(1);
+        let height = (size.height.0.ceil() as u64).max(1);
+
+        let mut pool = self.capture_textures.lock();
+        if let Some(index) = pool
+            .iter()
+            .position(|texture| texture.width() == width && texture.height() == height)
+        {
+            return pool.swap_remove(index);
+        }
+        drop(pool);
+
+        let descriptor = metal::TextureDescriptor::new();
+        descriptor.set_width(width);
+        descriptor.set_height(height);
+        descriptor.set_pixel_format(metal::MTLPixelFormat::BGRA8Unorm);
+        descriptor.set_usage(metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead);
+        descriptor.set_storage_mode(metal::MTLStorageMode::Private);
+        self.device.new_texture(&descriptor)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_scene(
+        &mut self,
+        scene: &Scene,
+        captures: &[metal::Texture],
+        instance_buffer: &mut InstanceBuffer,
+        instance_offset: &mut usize,
+        target: &metal::TextureRef,
+        target_origin: Point<ScaledPixels>,
+        viewport_size: Size<DevicePixels>,
+        command_buffer: &metal::CommandBufferRef,
+        configure_color_attachment: impl Fn(&RenderPassColorAttachmentDescriptorRef),
+    ) -> Result<()> {
+        let mut command_encoder = new_command_encoder(
+            command_buffer,
+            target,
+            viewport_size,
+            target_origin,
+            configure_color_attachment,
         );
 
         for batch in scene.batches() {
@@ -458,22 +607,23 @@ impl MetalRenderer {
                 PrimitiveBatch::Shadows(shadows) => self.draw_shadows(
                     shadows,
                     instance_buffer,
-                    &mut instance_offset,
+                    instance_offset,
                     viewport_size,
                     command_encoder,
                 ),
                 PrimitiveBatch::Quads(quads) => self.draw_quads(
                     quads,
                     instance_buffer,
-                    &mut instance_offset,
+                    instance_offset,
                     viewport_size,
                     command_encoder,
                 ),
                 PrimitiveBatch::Effects { effect_id, effects } => self.draw_effects(
                     effect_id,
                     effects,
+                    captures,
                     instance_buffer,
-                    &mut instance_offset,
+                    instance_offset,
                     viewport_size,
                     command_encoder,
                 ),
@@ -483,15 +633,16 @@ impl MetalRenderer {
                     let did_draw = self.draw_paths_to_intermediate(
                         paths,
                         instance_buffer,
-                        &mut instance_offset,
+                        instance_offset,
                         viewport_size,
                         command_buffer,
                     );
 
                     command_encoder = new_command_encoder(
                         command_buffer,
-                        drawable,
+                        target,
                         viewport_size,
+                        target_origin,
                         |color_attachment| {
                             color_attachment.set_load_action(metal::MTLLoadAction::Load);
                         },
@@ -501,7 +652,7 @@ impl MetalRenderer {
                         self.draw_paths_from_intermediate(
                             paths,
                             instance_buffer,
-                            &mut instance_offset,
+                            instance_offset,
                             viewport_size,
                             command_encoder,
                         )
@@ -512,7 +663,7 @@ impl MetalRenderer {
                 PrimitiveBatch::Underlines(underlines) => self.draw_underlines(
                     underlines,
                     instance_buffer,
-                    &mut instance_offset,
+                    instance_offset,
                     viewport_size,
                     command_encoder,
                 ),
@@ -523,7 +674,7 @@ impl MetalRenderer {
                     texture_id,
                     sprites,
                     instance_buffer,
-                    &mut instance_offset,
+                    instance_offset,
                     viewport_size,
                     command_encoder,
                 ),
@@ -534,14 +685,14 @@ impl MetalRenderer {
                     texture_id,
                     sprites,
                     instance_buffer,
-                    &mut instance_offset,
+                    instance_offset,
                     viewport_size,
                     command_encoder,
                 ),
                 PrimitiveBatch::Surfaces(surfaces) => self.draw_surfaces(
                     surfaces,
                     instance_buffer,
-                    &mut instance_offset,
+                    instance_offset,
                     viewport_size,
                     command_encoder,
                 ),
@@ -562,12 +713,7 @@ impl MetalRenderer {
         }
 
         command_encoder.end_encoding();
-
-        instance_buffer.metal_buffer.did_modify_range(NSRange {
-            location: 0,
-            length: instance_offset as NSUInteger,
-        });
-        Ok(command_buffer.to_owned())
+        Ok(())
     }
 
     fn draw_paths_to_intermediate(
@@ -766,6 +912,7 @@ impl MetalRenderer {
         &self,
         effect_id: EffectId,
         effects: &[EffectQuad],
+        captures: &[metal::Texture],
         instance_buffer: &mut InstanceBuffer,
         instance_offset: &mut usize,
         viewport_size: Size<DevicePixels>,
@@ -782,6 +929,15 @@ impl MetalRenderer {
         align_offset(instance_offset);
 
         command_encoder.set_render_pipeline_state(&pipeline_state);
+
+        // One batch is one effect at one draw order, so every quad in it reads
+        // the same capture and the texture binds once.
+        let source = effects
+            .first()
+            .and_then(|effect| effect.source)
+            .and_then(|id| captures.get(id.0 as usize))
+            .map_or(&*self.blank_texture, |texture| &**texture);
+        command_encoder.set_fragment_texture(effect::slots::MSL_SOURCE_TEXTURE as u64, Some(source));
 
         // The Metal layer blends straight alpha, so the epilogue must not
         // premultiply.
@@ -1306,8 +1462,12 @@ impl MetalRenderer {
 
 fn new_command_encoder<'a>(
     command_buffer: &'a metal::CommandBufferRef,
-    drawable: &'a metal::MetalDrawableRef,
+    target: &metal::TextureRef,
     viewport_size: Size<DevicePixels>,
+    // Where the target sits in the window. A capture's texture holds only its
+    // own region, so the viewport is shifted to bring window coordinates into
+    // it rather than translating every primitive.
+    target_origin: Point<ScaledPixels>,
     configure_color_attachment: impl Fn(&RenderPassColorAttachmentDescriptorRef),
 ) -> &'a metal::RenderCommandEncoderRef {
     let render_pass_descriptor = metal::RenderPassDescriptor::new();
@@ -1315,14 +1475,14 @@ fn new_command_encoder<'a>(
         .color_attachments()
         .object_at(0)
         .unwrap();
-    color_attachment.set_texture(Some(drawable.texture()));
+    color_attachment.set_texture(Some(target));
     color_attachment.set_store_action(metal::MTLStoreAction::Store);
     configure_color_attachment(color_attachment);
 
     let command_encoder = command_buffer.new_render_command_encoder(render_pass_descriptor);
     command_encoder.set_viewport(metal::MTLViewport {
-        originX: 0.0,
-        originY: 0.0,
+        originX: -target_origin.x.0 as f64,
+        originY: -target_origin.y.0 as f64,
         width: i32::from(viewport_size.width) as f64,
         height: i32::from(viewport_size.height) as f64,
         znear: 0.0,
