@@ -1102,12 +1102,14 @@ impl DirectXGlobalElements {
             [buffer]
         };
 
+        // Matches `effect::slots::SOURCE_TEXTURE`, which is where the reasons
+        // for filtered-and-transparent-outside are written down.
         let sampler = unsafe {
             let desc = D3D11_SAMPLER_DESC {
                 Filter: D3D11_FILTER_MIN_MAG_MIP_LINEAR,
-                AddressU: D3D11_TEXTURE_ADDRESS_WRAP,
-                AddressV: D3D11_TEXTURE_ADDRESS_WRAP,
-                AddressW: D3D11_TEXTURE_ADDRESS_WRAP,
+                AddressU: D3D11_TEXTURE_ADDRESS_BORDER,
+                AddressV: D3D11_TEXTURE_ADDRESS_BORDER,
+                AddressW: D3D11_TEXTURE_ADDRESS_BORDER,
                 MipLODBias: 0.0,
                 MaxAnisotropy: 1,
                 ComparisonFunc: D3D11_COMPARISON_ALWAYS,

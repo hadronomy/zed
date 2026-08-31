@@ -189,6 +189,23 @@ pub mod slots {
     /// Bind group holding what the effect is applied to.
     pub const SOURCE_GROUP: u32 = 1;
     /// The captured content.
+    ///
+    /// Sampled filtered, and transparent outside its bounds. Both halves of
+    /// that are load-bearing for anything that reads more than one texel.
+    ///
+    /// Filtering is not a quality nicety here: a wide kernel is affordable
+    /// precisely because one filtered tap can stand for two texels. And a
+    /// capture is the element's bounds and nothing more, so past its edge there
+    /// is genuinely no content — repeating would wrap the far side of a card
+    /// into the near one, and clamping would smear the edge texel out into a
+    /// streak. Reading transparent is the only answer that says what is true,
+    /// and it lets a kernel run off the edge and fade out on its own instead of
+    /// making every effect bounds-check its taps.
+    ///
+    /// Metal takes this as a `constexpr sampler` written into the generated
+    /// shader, which is how GPUI's own Metal shaders declare theirs. Direct3D
+    /// has no inline sampler, so a renderer-side one sits at
+    /// [`HLSL_SOURCE_SAMPLER_REGISTER`] and has to agree.
     pub const SOURCE_TEXTURE: u32 = 0;
 
     /// Metal texture index for the source.
@@ -196,14 +213,14 @@ pub mod slots {
 
     /// HLSL register for the source texture: `register(t0)`.
     pub const HLSL_SOURCE_REGISTER: u32 = 0;
-    /// HLSL register for its sampler: `register(s0)`.
+    /// HLSL register for its sampler: `register(s0)`. Metal has no equivalent,
+    /// because [`super::SAMPLING`] is written into the Metal shader itself.
     pub const HLSL_SOURCE_SAMPLER_REGISTER: u32 = 0;
 
-    /// Metal sampler index for the source.
-    pub const MSL_SOURCE_SAMPLER: u8 = 0;
     /// The sampler binding within [`SOURCE_GROUP`].
     pub const SOURCE_SAMPLER: u32 = 1;
 }
+
 
 /// Frame-wide data the shader reads. Mirrors `EffectGlobals` in the preamble.
 #[derive(Copy, Clone, Debug, Default)]
@@ -487,10 +504,12 @@ fn write_msl(
             ..Default::default()
         },
     );
+    // Written into the shader rather than bound, so the Metal renderer holds no
+    // sampler state and the pipeline looks like every other one GPUI drives.
     resources.insert(
         resource(slots::SOURCE_GROUP, slots::SOURCE_SAMPLER),
         msl::BindTarget {
-            sampler: Some(msl::BindSamplerTarget::Resource(slots::MSL_SOURCE_SAMPLER)),
+            sampler: Some(msl::BindSamplerTarget::Inline(0)),
             ..Default::default()
         },
     );
@@ -510,6 +529,13 @@ fn write_msl(
         // with macOS 10.14 and is older than anything GPUI runs on.
         lang_version: (2, 1),
         per_entry_point_map,
+        inline_samplers: vec![msl::sampler::InlineSampler {
+            address: [msl::sampler::Address::ClampToBorder; 3],
+            border_color: msl::sampler::BorderColor::TransparentBlack,
+            mag_filter: msl::sampler::Filter::Linear,
+            min_filter: msl::sampler::Filter::Linear,
+            ..Default::default()
+        }],
         ..Default::default()
     };
     let (source, _) = msl::write_string(module, info, &options, &Default::default())
@@ -654,4 +680,124 @@ pub fn validate_all() -> Result<()> {
         bail!("{} effect translations failed:\n{}", failures.len(), failures.join("\n\n"));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The smallest effect that touches every part of the ABI: a parameter of
+    /// each kind, and a read of the source.
+    const PROBE: EffectDef = EffectDef {
+        name: "gpui-abi-probe",
+        wgsl: "fn effect(input: EffectInput) -> vec4<f32> {
+                   let sampled = source(input.uv);
+                   let mixed = mix(sampled, tint(input), amount(input));
+                   return vec4<f32>(to_encoded(to_linear(mixed.rgb)), mixed.a);
+               }",
+        parameters: &[
+            Parameter {
+                name: "amount",
+                kind: ParameterKind::Scalar,
+            },
+            Parameter {
+                name: "tint",
+                kind: ParameterKind::Color,
+            },
+        ],
+    };
+
+    #[test]
+    fn the_abi_translates_for_every_backend() {
+        for target in [ShaderTarget::Wgsl, ShaderTarget::Msl, ShaderTarget::Hlsl] {
+            translate(&PROBE, target).unwrap_or_else(|error| panic!("{target:?}: {error:#}"));
+        }
+    }
+
+    #[test]
+    fn metal_gets_its_sampler_written_into_the_shader() {
+        // The Metal renderer binds no sampler state, exactly as GPUI's own
+        // Metal pipelines bind none. If naga stops inlining it, sampling
+        // silently returns nothing rather than failing to compile.
+        let source = translate(&PROBE, ShaderTarget::Msl).unwrap();
+        assert!(
+            source.contains("constexpr metal::sampler") || source.contains("constexpr sampler"),
+            "no inline sampler in the Metal output:\n{source}"
+        );
+        assert!(
+            source.contains("filter::linear"),
+            "the inline sampler is not filtered:\n{source}"
+        );
+        assert!(
+            source.contains("clamp_to_border"),
+            "the inline sampler does not stop at the capture's edge:\n{source}"
+        );
+        // MSL's default border is transparent black, so naga writes no
+        // `border_color` at all for the one we want. Naming an opaque one is
+        // the only way the border could be wrong.
+        assert!(
+            !source.contains("border_color::opaque"),
+            "the inline sampler reads an opaque border outside the capture:\n{source}"
+        );
+    }
+
+    #[test]
+    fn no_hlsl_reaches_fxc_with_a_register_space() {
+        // Register spaces are Shader Model 5.1 syntax and Direct3D 11 compiles
+        // 5.0, so one surviving `flatten_sampler_heap` is a shader that builds
+        // in a test and fails on a customer's machine.
+        let source = translate(&PROBE, ShaderTarget::Hlsl).unwrap();
+        assert!(!source.contains(", space"), "a register space survived:\n{source}");
+        assert!(!source.contains(SAMPLER_HEAP), "the sampler heap survived:\n{source}");
+        assert!(
+            source.contains(&format!(
+                "register(s{})",
+                slots::HLSL_SOURCE_SAMPLER_REGISTER
+            )),
+            "the flattened sampler is not at the register the renderer binds:\n{source}"
+        );
+    }
+
+    #[test]
+    fn the_shader_and_the_cpu_agree_on_the_instance_layout() {
+        // WGSL and Rust apply different alignment rules, so the two structs can
+        // drift apart with both sides still compiling. The effect then reads
+        // its parameters out of padding, which looks like a broken shader.
+        assert_eq!(
+            shader_instance_size().unwrap() as usize,
+            std::mem::size_of::<EffectInstance>()
+        );
+    }
+
+    #[test]
+    fn a_shader_that_calls_an_undeclared_parameter_fails() {
+        let wrong = EffectDef {
+            name: "gpui-abi-probe-undeclared",
+            wgsl: "fn effect(input: EffectInput) -> vec4<f32> { return vec4<f32>(nope(input)); }",
+            parameters: &[],
+        };
+        let error = translate(&wrong, ShaderTarget::Wgsl).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("gpui-abi-probe-undeclared"),
+            "the error does not name the effect: {error:#}"
+        );
+    }
+
+    #[test]
+    fn an_effect_that_wants_more_slots_than_exist_is_refused() {
+        const TOO_MANY: &[Parameter] = &[Parameter {
+            name: "colour",
+            kind: ParameterKind::Color,
+        }; PARAM_COUNT];
+        let greedy = EffectDef {
+            name: "gpui-abi-probe-greedy",
+            wgsl: "fn effect(input: EffectInput) -> vec4<f32> { return colour0(input); }",
+            parameters: TOO_MANY,
+        };
+        let error = translate(&greedy, ShaderTarget::Wgsl).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("parameter slots"),
+            "unexpected error: {error:#}"
+        );
+    }
 }

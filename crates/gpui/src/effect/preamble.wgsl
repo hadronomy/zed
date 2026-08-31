@@ -128,13 +128,36 @@ fn hsla_to_rgba(hsla: Hsla) -> vec4<f32> {
     return vec4<f32>(color, a);
 }
 
-/// The captured content at `uv`, where `0..1` spans the element's bounds.
+/// The captured content at `uv`, premultiplied.
 ///
-/// `input.uv` reads straight through; offsetting it is how an effect blurs,
-/// displaces or smears what it was given. Filtered, so a read between texels
-/// costs nothing extra — which is what makes a downsampled blur worth doing.
-fn source(uv: vec2<f32>) -> vec4<f32> {
+/// Reach for this only to combine several taps. A weighted sum of straight
+/// alpha pulls the colour of transparent texels into the result — and a
+/// transparent texel's colour is black, so a blur written against `source` gets
+/// a dark halo around everything. Premultiplied texels weight colour by
+/// coverage, which is what makes the sum mean anything. Divide the summed
+/// colour by the summed alpha to get back to what `effect` returns.
+fn source_premultiplied(uv: vec2<f32>) -> vec4<f32> {
     return textureSampleLevel(effect_source, effect_source_sampler, uv, 0.0);
+}
+
+/// The captured content at `uv`, where `0..1` spans the effect's bounds.
+///
+/// Straight alpha and sRGB-encoded — the same shape `effect` returns, so
+/// `return source(input.uv);` is the identity and every effect that only tints
+/// or moves what it was given is right by construction. `input.uv` reads
+/// straight through; offsetting it is how an effect displaces or smears.
+///
+/// The texture holds premultiplied colour, because that is what blending a
+/// subtree into a cleared target produces. Dividing it back out here is what
+/// keeps that off an effect author's desk — leave it in and the composite
+/// multiplies by coverage a second time, which reads as translucent content
+/// going dark rather than as a bug.
+fn source(uv: vec2<f32>) -> vec4<f32> {
+    let texel = source_premultiplied(uv);
+    if texel.a <= 0.0 {
+        return vec4<f32>(0.0);
+    }
+    return vec4<f32>(texel.rgb / texel.a, texel.a);
 }
 
 // The render targets are BGRA8 UNORM on every backend we drive, so GPUI blends
