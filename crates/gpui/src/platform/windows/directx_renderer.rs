@@ -101,6 +101,10 @@ struct DirectXGlobalElements {
     // Effects declare their own globals, whose layout differs from
     // `GlobalParams`, so they cannot share its buffer.
     effect_globals_buffer: [Option<ID3D11Buffer>; 1],
+    // Bound where a capture would be. Without it an effect that reads
+    // `source()` gets whichever shader resource was left bound — the glyph
+    // atlas, usually — instead of a defined blank.
+    blank_view: [Option<ID3D11ShaderResourceView>; 1],
     sampler: [Option<ID3D11SamplerState>; 1],
 }
 
@@ -567,12 +571,14 @@ impl DirectXRenderer {
             &self.devices.device_context,
             &self.effect_instances,
         )?;
-        pipeline.draw(
+        // Direct3D does not resolve captures yet, so every effect reads the
+        // blank. Binding it is what keeps `source()` from returning the atlas.
+        pipeline.draw_with_texture(
             &self.devices.device_context,
+            &self.globals.blank_view,
             &self.resources.viewport,
             &self.globals.effect_globals_buffer,
-            D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP,
-            4,
+            &self.globals.sampler,
             effects.len() as u32,
         )
     }
@@ -993,9 +999,36 @@ impl DirectXGlobalElements {
             [output]
         };
 
+        let blank_view = unsafe {
+            let desc = D3D11_TEXTURE2D_DESC {
+                Width: 1,
+                Height: 1,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: RENDER_TARGET_FORMAT,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Usage: D3D11_USAGE_IMMUTABLE,
+                BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+                ..Default::default()
+            };
+            let transparent = [0u8; 4];
+            let data = D3D11_SUBRESOURCE_DATA {
+                pSysMem: transparent.as_ptr() as *const _,
+                SysMemPitch: 4,
+                SysMemSlicePitch: 0,
+            };
+            let mut texture = None;
+            device.CreateTexture2D(&desc, Some(&data), Some(&mut texture))?;
+            let texture = texture.context("creating the blank effect source")?;
+            let mut view = None;
+            device.CreateShaderResourceView(&texture, None, Some(&mut view))?;
+            [view]
+        };
+
         Ok(Self {
             global_params_buffer,
             effect_globals_buffer,
+            blank_view,
             sampler,
         })
     }
