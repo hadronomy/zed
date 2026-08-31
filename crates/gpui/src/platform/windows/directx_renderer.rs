@@ -56,6 +56,18 @@ pub(crate) struct DirectXRenderer {
     // frame it is painted.
     effect_pipelines: FxHashMap<EffectId, Option<PipelineState<EffectInstance>>>,
     effect_instances: Vec<EffectInstance>,
+    // Reused across frames, matched by exact size. A capture's size changes only
+    // when its element does.
+    capture_targets: Vec<CaptureTarget>,
+}
+
+/// A texture one capture resolves into, and the two views the renderer needs of
+/// it: one to draw the subtree, one for the effect that composites it.
+struct CaptureTarget {
+    width: u32,
+    height: u32,
+    render_target: [Option<ID3D11RenderTargetView>; 1],
+    shader_resource: [Option<ID3D11ShaderResourceView>; 1],
 }
 
 /// Direct3D objects
@@ -184,6 +196,7 @@ impl DirectXRenderer {
             font_info: Self::get_font_info(),
             effect_pipelines: FxHashMap::default(),
             effect_instances: Vec::new(),
+            capture_targets: Vec::new(),
         })
     }
 
@@ -318,17 +331,91 @@ impl DirectXRenderer {
 
     pub(crate) fn draw(&mut self, scene: &Scene) -> Result<()> {
         self.pre_draw()?;
-        // Until captures resolve to their own targets here, their content is
-        // drawn straight into the frame. The effect is lost; the content is not,
-        // which is the right way round for a backend that is behind.
-        for capture in &scene.captures {
-            self.draw_scene(&capture.scene)?;
+        let captures = self.render_captures(scene)?;
+
+        // Back to the swap chain, and to the viewport the frame is measured in.
+        unsafe {
+            self.devices
+                .device_context
+                .OMSetRenderTargets(Some(&self.resources.render_target_view), None);
         }
-        self.draw_scene(scene)?;
+        self.draw_scene(scene, &captures)?;
         self.present()
     }
 
-    fn draw_scene(&mut self, scene: &Scene) -> Result<()> {
+    /// Resolve every capture in `scene` into a texture of its own, innermost
+    /// first, and return them indexed by `CaptureId`.
+    fn render_captures(&mut self, scene: &Scene) -> Result<Vec<usize>> {
+        if scene.captures.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut resolved = Vec::with_capacity(scene.captures.len());
+        for capture in &scene.captures {
+            let nested = self.render_captures(&capture.scene)?;
+            let index = self.capture_target(capture.bounds.size)?;
+
+            unsafe {
+                let target = &self.capture_targets[index];
+                self.devices
+                    .device_context
+                    .ClearRenderTargetView(target.render_target[0].as_ref().unwrap(), &[0.0; 4]);
+                self.devices
+                    .device_context
+                    .OMSetRenderTargets(Some(&target.render_target), None);
+            }
+
+            // The subtree still carries window coordinates, so the viewport is
+            // shifted to bring them into a texture that holds only its region.
+            // Every draw call re-applies `resources.viewport`, so this is the
+            // one in force until it is put back.
+            let frame_viewport = self.resources.viewport;
+            self.resources.viewport = [D3D11_VIEWPORT {
+                TopLeftX: -capture.bounds.origin.x.0,
+                TopLeftY: -capture.bounds.origin.y.0,
+                Width: frame_viewport[0].Width,
+                Height: frame_viewport[0].Height,
+                MinDepth: 0.0,
+                MaxDepth: 1.0,
+            }];
+            let drawn = self.draw_scene(&capture.scene, &nested);
+            self.resources.viewport = frame_viewport;
+            drawn?;
+
+            resolved.push(index);
+        }
+        Ok(resolved)
+    }
+
+    /// Index of a target of this size, creating one if the pool has none.
+    fn capture_target(&mut self, size: Size<ScaledPixels>) -> Result<usize> {
+        let width = (size.width.0.ceil() as u32).max(1);
+        let height = (size.height.0.ceil() as u32).max(1);
+        if let Some(index) = self
+            .capture_targets
+            .iter()
+            .position(|target| target.width == width && target.height == height)
+        {
+            return Ok(index);
+        }
+
+        let (texture, shader_resource) =
+            create_path_intermediate_texture(&self.devices.device, width, height)?;
+        let mut render_target = None;
+        unsafe {
+            self.devices
+                .device
+                .CreateRenderTargetView(&texture, None, Some(&mut render_target))?;
+        }
+        self.capture_targets.push(CaptureTarget {
+            width,
+            height,
+            render_target: [render_target],
+            shader_resource,
+        });
+        Ok(self.capture_targets.len() - 1)
+    }
+
+    fn draw_scene(&mut self, scene: &Scene, captures: &[usize]) -> Result<()> {
         for batch in scene.batches() {
             match batch {
                 PrimitiveBatch::Shadows(shadows) => self.draw_shadows(shadows),
@@ -338,7 +425,7 @@ impl DirectXRenderer {
                     self.draw_paths_from_intermediate(paths)
                 }
                 PrimitiveBatch::Effects { effect_id, effects } => {
-                    self.draw_effects(effect_id, effects)
+                    self.draw_effects(effect_id, effects, captures)
                 }
                 PrimitiveBatch::Underlines(underlines) => self.draw_underlines(underlines),
                 PrimitiveBatch::MonochromeSprites {
@@ -549,7 +636,12 @@ impl DirectXRenderer {
         )
     }
 
-    fn draw_effects(&mut self, effect_id: EffectId, effects: &[EffectQuad]) -> Result<()> {
+    fn draw_effects(
+        &mut self,
+        effect_id: EffectId,
+        effects: &[EffectQuad],
+        captures: &[usize],
+    ) -> Result<()> {
         if effects.is_empty() {
             return Ok(());
         }
@@ -571,11 +663,19 @@ impl DirectXRenderer {
             &self.devices.device_context,
             &self.effect_instances,
         )?;
-        // Direct3D does not resolve captures yet, so every effect reads the
-        // blank. Binding it is what keeps `source()` from returning the atlas.
+        // One batch is one effect at one draw order, so every quad in it reads
+        // the same capture. Without a capture the blank keeps `source()` from
+        // returning whichever resource was bound last.
+        let source = effects
+            .first()
+            .and_then(|effect| effect.source)
+            .and_then(|id| captures.get(id.0 as usize))
+            .map_or(&self.globals.blank_view, |index| {
+                &self.capture_targets[*index].shader_resource
+            });
         pipeline.draw_with_texture(
             &self.devices.device_context,
-            &self.globals.blank_view,
+            source,
             &self.resources.viewport,
             &self.globals.effect_globals_buffer,
             &self.globals.sampler,
