@@ -39,6 +39,8 @@ pub use gpui_macros::Effect;
 
 use anyhow::{Context as _, Result, anyhow, bail};
 
+use crate::{Hsla, Pixels, Point};
+
 /// Declarations an effect may use. Prepended to every effect module.
 pub const PREAMBLE: &str = include_str!("effect/preamble.wgsl");
 
@@ -76,23 +78,35 @@ pub struct EffectDef {
     pub wgsl: &'static str,
     /// The values the shader reads, in the order the application writes them.
     /// GPUI generates an accessor for each, so neither side spells a slot.
-    pub parameters: &'static [Parameter],
+    pub parameters: &'static [ParameterDef],
 }
 
 /// One value an effect hands its shader, and the accessor generated for it.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub struct Parameter {
+pub struct ParameterDef {
     /// The name of the generated accessor function.
     pub name: &'static str,
     /// What that accessor returns, and how many slots it occupies.
     pub kind: ParameterKind,
 }
 
-/// What a [`Parameter`]'s generated accessor returns.
+/// What a parameter's generated accessor returns.
+///
+/// Adding a variant means teaching `accessors` to write it and giving some type
+/// a [`Parameter`] impl that produces it; a kind nothing implements is a kind
+/// no effect can use.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum ParameterKind {
     /// One float; the accessor returns `f32`.
     Scalar,
+    /// One float holding zero or one; the accessor returns `bool`, so a shader
+    /// branches on it rather than comparing a float against a threshold.
+    Flag,
+    /// One float holding a small whole number; the accessor returns `u32`, for
+    /// a choice with more than two answers.
+    Index,
+    /// Two floats; the accessor returns `vec2<f32>`.
+    Point,
     /// Four floats holding an [`crate::Hsla`]; the accessor returns
     /// straight-alpha `vec4<f32>`, converted by the same code that resolves a
     /// quad's background.
@@ -100,12 +114,86 @@ pub enum ParameterKind {
 }
 
 impl ParameterKind {
-    /// How many of the sixteen slots this occupies.
+    /// How many of [`PARAM_COUNT`] slots this occupies.
     pub const fn slots(self) -> usize {
         match self {
-            ParameterKind::Scalar => 1,
+            ParameterKind::Scalar | ParameterKind::Flag | ParameterKind::Index => 1,
+            ParameterKind::Point => 2,
             ParameterKind::Color => 4,
         }
+    }
+}
+
+/// A type an effect can hold as a parameter.
+///
+/// The derive dispatches on this rather than on the spelling of a field's type,
+/// which is what lets the set be open: implement it for your own type and the
+/// derive accepts it, with no change to GPUI. It is also what makes a wrong
+/// type a trait-bound error pointing at the field, instead of a shader quietly
+/// reading four floats out of something that was never a colour.
+///
+/// A length arrives in the shader as logical pixels, because that is the unit
+/// an effect is written in; multiply by `input.scale` for device pixels.
+///
+/// ```ignore
+/// enum Axis { Across, Down }
+///
+/// impl Parameter for Axis {
+///     const KIND: ParameterKind = ParameterKind::Flag;
+///     fn write(&self, slots: &mut [f32]) {
+///         slots[0] = matches!(self, Axis::Down) as u8 as f32;
+///     }
+/// }
+/// ```
+pub trait Parameter {
+    /// What the generated accessor returns, and how many slots this occupies.
+    const KIND: ParameterKind;
+
+    /// Write into `slots`, which is exactly `KIND.slots()` long.
+    fn write(&self, slots: &mut [f32]);
+}
+
+impl Parameter for f32 {
+    const KIND: ParameterKind = ParameterKind::Scalar;
+
+    fn write(&self, slots: &mut [f32]) {
+        slots[0] = *self;
+    }
+}
+
+impl Parameter for Pixels {
+    const KIND: ParameterKind = ParameterKind::Scalar;
+
+    fn write(&self, slots: &mut [f32]) {
+        slots[0] = self.0;
+    }
+}
+
+impl Parameter for bool {
+    const KIND: ParameterKind = ParameterKind::Flag;
+
+    fn write(&self, slots: &mut [f32]) {
+        slots[0] = *self as u8 as f32;
+    }
+}
+
+impl Parameter for Point<Pixels> {
+    const KIND: ParameterKind = ParameterKind::Point;
+
+    fn write(&self, slots: &mut [f32]) {
+        slots[0] = self.x.0;
+        slots[1] = self.y.0;
+    }
+}
+
+impl Parameter for Hsla {
+    const KIND: ParameterKind = ParameterKind::Color;
+
+    fn write(&self, slots: &mut [f32]) {
+        slots[0] = self.h;
+        slots[1] = self.s;
+        slots[2] = self.l;
+        slots[3] = self.a;
     }
 }
 
@@ -133,7 +221,7 @@ pub trait Effect: 'static {
     /// WGSL defining `fn effect(input: EffectInput) -> vec4<f32>`.
     const SOURCE: &'static str;
     /// The values the shader reads, in the order [`Effect::params`] writes.
-    const PARAMETERS: &'static [Parameter];
+    const PARAMETERS: &'static [ParameterDef];
 
     /// The floats the shader reads, in [`Effect::PARAMETERS`] order.
     fn params(&self) -> [f32; PARAM_COUNT];
@@ -321,6 +409,14 @@ pub fn register(def: EffectDef) -> EffectId {
     // the already-registered path takes a read lock and the write lock is only
     // reached once per effect in the life of the process.
     if let Some(id) = lookup(def.name) {
+        // Two different effects under one name means the second one silently
+        // draws the first one's shader, which reads as a baffling wrong picture
+        // rather than as the copy-paste it usually is.
+        debug_assert!(
+            definition(id) == Some(def),
+            "two different effects are both registered as `{}`",
+            def.name
+        );
         return id;
     }
     let mut effects = registry().write().unwrap();
@@ -403,6 +499,22 @@ fn accessors(def: &EffectDef) -> String {
         match parameter.kind {
             ParameterKind::Scalar => source.push_str(&format!(
                 "fn {name}(input: EffectInput) -> f32 {{ return param(input, {slot}u); }}\n"
+            )),
+            // Compared here rather than in the effect, so no shader invents its
+            // own threshold for what counts as set.
+            ParameterKind::Flag => source.push_str(&format!(
+                "fn {name}(input: EffectInput) -> bool {{ return param(input, {slot}u) > 0.5; }}\n"
+            )),
+            // Rounded rather than truncated: the value made a round trip
+            // through an f32, and 2.0 can arrive as 1.9999999.
+            ParameterKind::Index => source.push_str(&format!(
+                "fn {name}(input: EffectInput) -> u32 {{ \
+                 return u32(round(max(param(input, {slot}u), 0.0))); }}\n"
+            )),
+            ParameterKind::Point => source.push_str(&format!(
+                "fn {name}(input: EffectInput) -> vec2<f32> {{ \
+                 return vec2<f32>(param(input, {slot}u), param(input, {y}u)); }}\n",
+                y = slot + 1,
             )),
             ParameterKind::Color => source.push_str(&format!(
                 "fn {name}(input: EffectInput) -> vec4<f32> {{ return hsla_to_rgba(Hsla(\
@@ -782,11 +894,11 @@ mod tests {
                    return vec4<f32>(to_encoded(to_linear(mixed.rgb)), mixed.a);
                }",
         parameters: &[
-            Parameter {
+            ParameterDef {
                 name: "amount",
                 kind: ParameterKind::Scalar,
             },
-            Parameter {
+            ParameterDef {
                 name: "tint",
                 kind: ParameterKind::Color,
             },
@@ -853,6 +965,119 @@ mod tests {
         );
     }
 
+    /// Every kind, so a new one cannot be added without a shader that uses it.
+    const EVERY_KIND: EffectDef = EffectDef {
+        name: "gpui-abi-every-kind",
+        wgsl: "fn effect(input: EffectInput) -> vec4<f32> {
+                   var out = vec4<f32>(depth(input));
+                   if lit(input) { out += tint(input); }
+                   if mode(input) == 2u { out += vec4<f32>(centre(input), 0.0, 0.0); }
+                   return out;
+               }",
+        parameters: &[
+            ParameterDef { name: "depth", kind: ParameterKind::Scalar },
+            ParameterDef { name: "lit", kind: ParameterKind::Flag },
+            ParameterDef { name: "mode", kind: ParameterKind::Index },
+            ParameterDef { name: "centre", kind: ParameterKind::Point },
+            ParameterDef { name: "tint", kind: ParameterKind::Color },
+        ],
+    };
+
+    #[test]
+    fn every_parameter_kind_generates_wgsl_that_translates() {
+        for target in [ShaderTarget::Wgsl, ShaderTarget::Msl, ShaderTarget::Hlsl] {
+            translate(&EVERY_KIND, target)
+                .unwrap_or_else(|error| panic!("{target:?}: {error:#}"));
+        }
+    }
+
+    #[test]
+    fn an_accessor_returns_the_type_its_kind_promises() {
+        let wgsl = accessors(&EVERY_KIND);
+        for (name, returns) in [
+            ("depth", "f32"),
+            ("lit", "bool"),
+            ("mode", "u32"),
+            ("centre", "vec2<f32>"),
+            ("tint", "vec4<f32>"),
+        ] {
+            assert!(
+                wgsl.contains(&format!("fn {name}(input: EffectInput) -> {returns}")),
+                "`{name}` does not return {returns}:\n{wgsl}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_parameter_lands_on_the_slots_the_ones_before_it_left() {
+        // Slot order is field order, and every width comes from the kind. A
+        // parameter that claims the wrong width silently shifts every one after
+        // it, which reads as an effect ignoring its own settings.
+        let mut slot = 0;
+        for parameter in EVERY_KIND.parameters {
+            let accessor = format!("fn {}(input: EffectInput)", parameter.name);
+            let generated = accessors(&EVERY_KIND);
+            let line = generated
+                .lines()
+                .find(|line| line.starts_with(&accessor))
+                .unwrap_or_else(|| panic!("no accessor for `{}`", parameter.name));
+            assert!(
+                line.contains(&format!("param(input, {slot}u)")),
+                "`{}` should start at slot {slot}: {line}",
+                parameter.name
+            );
+            slot += parameter.kind.slots();
+        }
+        assert_eq!(slot, 9, "the fixture stopped covering what it was written for");
+    }
+
+    #[test]
+    fn a_flag_reaches_the_shader_as_zero_or_one() {
+        let mut slots = [7.0; 1];
+        Parameter::write(&true, &mut slots);
+        assert_eq!(slots[0], 1.0);
+        Parameter::write(&false, &mut slots);
+        assert_eq!(slots[0], 0.0);
+    }
+
+    #[test]
+    fn a_length_reaches_the_shader_as_logical_pixels() {
+        // Not device pixels: an effect multiplies by `input.scale` itself, and
+        // a value already scaled would be squared on a retina display — which
+        // looks plausible, so nothing else would catch it.
+        let mut slots = [0.0; 1];
+        Parameter::write(&crate::px(12.0), &mut slots);
+        assert_eq!(slots[0], 12.0);
+    }
+
+    #[test]
+    fn a_point_writes_x_then_y() {
+        let mut slots = [0.0; 2];
+        Parameter::write(&crate::point(crate::px(3.0), crate::px(4.0)), &mut slots);
+        assert_eq!(slots, [3.0, 4.0]);
+    }
+
+    #[test]
+    fn every_kind_claims_the_width_it_writes() {
+        // `write` is handed a slice cut to `KIND.slots()`, so a kind that
+        // understates its width panics and one that overstates it leaves a gap
+        // the next parameter never sees.
+        fn check<P: Parameter>(value: P) {
+            let mut slots = vec![f32::NAN; P::KIND.slots()];
+            value.write(&mut slots);
+            assert!(
+                slots.iter().all(|slot| !slot.is_nan()),
+                "{:?} left a slot unwritten",
+                P::KIND
+            );
+        }
+        check(1.0f32);
+        check(true);
+        check(crate::px(1.0));
+        check(crate::point(crate::px(1.0), crate::px(2.0)));
+        check(crate::red());
+    }
+
     #[test]
     fn the_shader_and_the_cpu_agree_on_the_instance_layout() {
         // WGSL and Rust apply different alignment rules, so the two structs can
@@ -880,7 +1105,7 @@ mod tests {
 
     #[test]
     fn an_effect_that_wants_more_slots_than_exist_is_refused() {
-        const TOO_MANY: &[Parameter] = &[Parameter {
+        const TOO_MANY: &[ParameterDef] = &[ParameterDef {
             name: "colour",
             kind: ParameterKind::Color,
         }; PARAM_COUNT];

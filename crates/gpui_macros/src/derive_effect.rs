@@ -1,6 +1,6 @@
 use proc_macro::TokenStream;
 use quote::quote;
-use syn::{Data, DeriveInput, Fields, LitStr, Type, parse_macro_input, spanned::Spanned};
+use syn::{Data, DeriveInput, Fields, LitStr, parse_macro_input};
 
 pub fn derive_effect(input: TokenStream) -> TokenStream {
     let ast = parse_macro_input!(input as DeriveInput);
@@ -37,73 +37,73 @@ pub fn derive_effect(input: TokenStream) -> TokenStream {
         return error(ast.ident.span(), "an effect must have named fields");
     };
 
-    let mut parameters = Vec::new();
+    // Every field is described and written through `Parameter`, so this macro
+    // never has to recognise a type. It cannot: a derive sees the spelling of a
+    // field's type and nothing else, and matching on the spelling accepts an
+    // alias or a same-named type from elsewhere and then reads it as something
+    // it is not. Deferring to the trait turns that into a bound error on the
+    // field, and lets an application add a type without touching GPUI.
+    let mut declarations = Vec::new();
     let mut writes = Vec::new();
-    let mut slot = 0usize;
+    let mut widths = Vec::new();
     for field in &fields.named {
         let Some(identifier) = &field.ident else {
             continue;
         };
         let literal = LitStr::new(&identifier.to_string(), identifier.span());
+        let ty = &field.ty;
 
-        match type_name_of(&field.ty).as_deref() {
-            Some("f32") => {
-                parameters.push(quote! {
-                    gpui::effect::Parameter {
-                        name: #literal,
-                        kind: gpui::effect::ParameterKind::Scalar,
-                    }
-                });
-                writes.push(quote! { params[#slot] = self.#identifier; });
-                slot += 1;
+        declarations.push(quote! {
+            gpui::effect::ParameterDef {
+                name: #literal,
+                kind: <#ty as gpui::effect::Parameter>::KIND,
             }
-            Some("Hsla") => {
-                let (hue, saturation, lightness, alpha) =
-                    (slot, slot + 1, slot + 2, slot + 3);
-                parameters.push(quote! {
-                    gpui::effect::Parameter {
-                        name: #literal,
-                        kind: gpui::effect::ParameterKind::Color,
-                    }
-                });
-                writes.push(quote! {
-                    params[#hue] = self.#identifier.h;
-                    params[#saturation] = self.#identifier.s;
-                    params[#lightness] = self.#identifier.l;
-                    params[#alpha] = self.#identifier.a;
-                });
-                slot += 4;
+        });
+        writes.push(quote! {
+            {
+                let width = <#ty as gpui::effect::Parameter>::KIND.slots();
+                gpui::effect::Parameter::write(&self.#identifier, &mut params[at..at + width]);
+                at += width;
             }
-            _ => {
-                return error(
-                    field.ty.span(),
-                    "an effect parameter must be `f32` or `Hsla`",
-                );
-            }
-        }
+        });
+        widths.push(quote! {
+            <#ty as gpui::effect::Parameter>::KIND.slots()
+        });
     }
 
     quote! {
+        // The budget is fixed and every width is a constant, so overrunning it
+        // is something the compiler can know. Left to `translate`, the same
+        // mistake is an effect that registers, fails at startup and draws
+        // nothing.
+        const _: () = {
+            let mut total = 0usize;
+            #( total += #widths; )*
+            assert!(
+                total <= gpui::effect::PARAM_COUNT,
+                concat!(
+                    "effect `",
+                    stringify!(#type_name),
+                    "` needs more parameter slots than an effect has",
+                ),
+            );
+        };
+
         impl gpui::effect::Effect for #type_name {
             const NAME: &'static str = #name;
             const SOURCE: &'static str = include_str!(#source);
-            const PARAMETERS: &'static [gpui::effect::Parameter] = &[#(#parameters),*];
+            const PARAMETERS: &'static [gpui::effect::ParameterDef] = &[#(#declarations),*];
 
             fn params(&self) -> [f32; gpui::effect::PARAM_COUNT] {
                 let mut params = [0.0; gpui::effect::PARAM_COUNT];
+                let mut at = 0usize;
                 #(#writes)*
+                let _ = at;
                 params
             }
         }
     }
     .into()
-}
-
-fn type_name_of(ty: &Type) -> Option<String> {
-    match ty {
-        Type::Path(path) => Some(path.path.segments.last()?.ident.to_string()),
-        _ => None,
-    }
 }
 
 fn error(span: proc_macro2::Span, message: &str) -> TokenStream {
