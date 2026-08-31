@@ -365,25 +365,47 @@ impl DirectXRenderer {
             }
 
             // The subtree still carries window coordinates, so the viewport is
-            // shifted to bring them into a texture that holds only its region.
-            // Every draw call re-applies `resources.viewport`, so this is the
-            // one in force until it is put back.
-            let frame_viewport = self.resources.viewport;
-            self.resources.viewport = [D3D11_VIEWPORT {
+            // shifted to bring them into a texture holding only its region.
+            let frame = self.resources.viewport[0];
+            let shifted = D3D11_VIEWPORT {
                 TopLeftX: -capture.bounds.origin.x.0,
                 TopLeftY: -capture.bounds.origin.y.0,
-                Width: frame_viewport[0].Width,
-                Height: frame_viewport[0].Height,
+                Width: frame.Width,
+                Height: frame.Height,
                 MinDepth: 0.0,
                 MaxDepth: 1.0,
-            }];
-            let drawn = self.draw_scene(&capture.scene, &nested);
-            self.resources.viewport = frame_viewport;
-            drawn?;
+            };
+            self.with_viewport(shifted, |renderer| {
+                renderer.draw_scene(&capture.scene, &nested)
+            })?;
 
             resolved.push(index);
         }
         Ok(resolved)
+    }
+
+    /// Run `pass` with `viewport` in force, and put the previous one back
+    /// however `pass` returns.
+    ///
+    /// Every draw call in this renderer re-applies `resources.viewport`, so a
+    /// pass needing a different one installs it here rather than threading it
+    /// through each call site. Restoring on the error path is the whole reason
+    /// this is a function: a shifted viewport left in force would offset every
+    /// element drawn after it, for the rest of the frame.
+    ///
+    /// A panic still skips the restore. A `Drop` guard would cover that, but it
+    /// would have to hold the renderer mutably and so could not lend it to
+    /// `pass`; a panic here is fatal to the frame regardless.
+    fn with_viewport<R>(
+        &mut self,
+        viewport: D3D11_VIEWPORT,
+        pass: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let previous = self.resources.viewport;
+        self.resources.viewport = [viewport];
+        let result = pass(self);
+        self.resources.viewport = previous;
+        result
     }
 
     /// Index of a target of this size, creating one if the pool has none.
