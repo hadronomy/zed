@@ -196,6 +196,13 @@ pub mod slots {
 
     /// HLSL register for the source texture: `register(t0)`.
     pub const HLSL_SOURCE_REGISTER: u32 = 0;
+    /// HLSL register for its sampler: `register(s0)`.
+    pub const HLSL_SOURCE_SAMPLER_REGISTER: u32 = 0;
+
+    /// Metal sampler index for the source.
+    pub const MSL_SOURCE_SAMPLER: u8 = 0;
+    /// The sampler binding within [`SOURCE_GROUP`].
+    pub const SOURCE_SAMPLER: u32 = 1;
 }
 
 /// Frame-wide data the shader reads. Mirrors `EffectGlobals` in the preamble.
@@ -480,6 +487,13 @@ fn write_msl(
             ..Default::default()
         },
     );
+    resources.insert(
+        resource(slots::SOURCE_GROUP, slots::SOURCE_SAMPLER),
+        msl::BindTarget {
+            sampler: Some(msl::BindSamplerTarget::Resource(slots::MSL_SOURCE_SAMPLER)),
+            ..Default::default()
+        },
+    );
 
     let entry_point_resources = msl::EntryPointResources {
         resources,
@@ -549,8 +563,78 @@ fn write_hlsl(
     writer
         .write(module, info, None)
         .with_context(|| format!("writing HLSL for effect `{}`", def.name))?;
+    flatten_sampler_heap(&mut source, def.name)?;
     Ok(source)
 }
+
+/// Rewrite naga's Direct3D 12 sampler heap into a plain Shader Model 5.0 binding.
+///
+/// naga emits every sampler as an indirection through two 2048-entry heaps and a
+/// per-group index buffer, addressed with register spaces. Spaces are Shader
+/// Model 5.1 syntax, so fxc rejects the result even when asked for 5.0, and
+/// naga offers no option to turn it off (gfx-rs/wgpu#8120).
+///
+/// The indirection exists so a bind group can hold an arbitrary number of
+/// dynamically indexed samplers. The effect ABI holds exactly one, at a fixed
+/// slot, never comparison and never indexed, so the whole apparatus collapses to
+/// a single declaration. That is what makes this rewrite narrow enough to trust:
+/// it is not a general translation, it is the one shape our own preamble emits.
+///
+/// An error here means naga's output stopped looking the way this expects, which
+/// a test catches rather than a customer.
+fn flatten_sampler_heap(source: &mut String, name: &str) -> Result<()> {
+    if !source.contains(SAMPLER_HEAP) {
+        // No sampler in this effect, so nothing to flatten.
+        return Ok(());
+    }
+
+    let mut binding = None;
+    let mut rewritten = String::with_capacity(source.len());
+    for line in source.lines() {
+        let trimmed = line.trim_start();
+        // The heaps and the index buffer exist only to serve the indirection.
+        if trimmed.starts_with("SamplerState nagaSamplerHeap")
+            || trimmed.starts_with("SamplerComparisonState nagaComparisonSamplerHeap")
+            || trimmed.contains("SamplerIndexArray :")
+        {
+            continue;
+        }
+        // `static const SamplerState x = nagaSamplerHeap[...];` becomes the
+        // declaration of `x` itself.
+        if let Some(rest) = trimmed.strip_prefix("static const SamplerState ")
+            && let Some((sampler, _)) = rest.split_once(" = ")
+            && rest.contains(SAMPLER_HEAP)
+        {
+            binding = Some(sampler.to_string());
+            rewritten.push_str(&format!(
+                "SamplerState {sampler} : register(s{});\n",
+                slots::HLSL_SOURCE_SAMPLER_REGISTER
+            ));
+            continue;
+        }
+        rewritten.push_str(line);
+        rewritten.push('\n');
+    }
+
+    let Some(binding) = binding else {
+        bail!(
+            "effect `{name}` uses a sampler, but naga's heap did not have the shape this \
+             rewrites; see gfx-rs/wgpu#8120"
+        );
+    };
+    if rewritten.contains(SAMPLER_HEAP) || rewritten.contains(", space") {
+        bail!(
+            "effect `{name}` still references the sampler heap after flattening `{binding}`; \
+             naga's output has changed shape"
+        );
+    }
+
+    *source = rewritten;
+    Ok(())
+}
+
+/// The variable naga names its standard sampler heap.
+const SAMPLER_HEAP: &str = "nagaSamplerHeap";
 
 /// Translate every registered effect for every backend.
 ///
