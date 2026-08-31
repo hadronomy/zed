@@ -33,6 +33,17 @@ struct EffectInstance {
 @group(0) @binding(0) var<uniform> effect_globals: EffectGlobals;
 @group(0) @binding(1) var<storage, read> effect_instances: array<EffectInstance>;
 
+// What the effect is applied to, when there is one. An effect that reads this
+// outside a `paint_effect_over` gets a single transparent pixel rather than
+// whatever happened to be bound, so the failure is a blank result and not a
+// picture of another effect's texture.
+//
+// Read with `textureLoad` and no sampler, deliberately: naga's HLSL backend
+// emits samplers as a Direct3D 12 heap that Direct3D 11 cannot load, and it
+// offers no way to ask for a plain one. A sampler here would break every effect
+// on Windows, not only the ones that read this.
+@group(1) @binding(0) var effect_source: texture_2d<f32>;
+
 /// Everything an effect may read.
 struct EffectInput {
     /// 0..1 across the element.
@@ -118,6 +129,20 @@ fn hsla_to_rgba(hsla: Hsla) -> vec4<f32> {
     }
 
     return vec4<f32>(color, a);
+}
+
+/// The captured content at `uv`, where `0..1` spans the element's bounds.
+///
+/// `input.uv` reads straight through; offsetting it is how an effect blurs,
+/// displaces or smears what it was given. Reads outside the bounds clamp to the
+/// edge rather than wrapping.
+///
+/// Point-sampled. There is no hardware filtering here, so an effect that wants
+/// a value between texels has to take the four around it and mix them.
+fn source(uv: vec2<f32>) -> vec4<f32> {
+    let size = vec2<f32>(textureDimensions(effect_source, 0));
+    let texel = clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0)) * (size - 1.0);
+    return textureLoad(effect_source, vec2<i32>(texel), 0);
 }
 
 // The render targets are BGRA8 UNORM on every backend we drive, so GPUI blends

@@ -2848,6 +2848,7 @@ impl Window {
         self.next_frame.scene.insert_primitive(EffectQuad {
             order: 0,
             effect_id: effect.effect,
+            source: None,
             bounds: effect.bounds.scale(scale_factor),
             content_mask: content_mask.scale(scale_factor),
             corner_radii: effect.corner_radii.scale(scale_factor),
@@ -2855,6 +2856,55 @@ impl Window {
             opacity,
             params: effect.params,
         });
+    }
+
+    /// Paint `content` into an offscreen texture and composite it through an
+    /// effect, so the effect operates on what the content drew rather than on
+    /// pixels of its own.
+    ///
+    /// The content becomes its own stacking context, the way a CSS `filter`
+    /// makes one: ordering inside it is independent of the surrounding scene.
+    /// Text inside renders with grayscale anti-aliasing, because subpixel
+    /// coverage cannot be composited over a texture whose backdrop is unknown.
+    ///
+    /// A backend without an effect pipeline draws the content unchanged rather
+    /// than dropping it.
+    ///
+    /// This method should only be called as part of the paint phase of element
+    /// drawing.
+    pub fn paint_effect_over<R>(
+        &mut self,
+        effect: PaintEffect,
+        content: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.invalidator.debug_assert_paint();
+
+        let scale_factor = self.scale_factor();
+        let content_mask = self.content_mask();
+        let opacity = self.element_opacity();
+        let bounds = effect.bounds.scale(scale_factor);
+
+        // The content paints into a scene of its own, which is what makes the
+        // capture a stacking context rather than a slice of the parent's order.
+        let parent = mem::take(&mut self.next_frame.scene);
+        let result = content(self);
+        let mut captured = mem::replace(&mut self.next_frame.scene, parent);
+        captured.finish();
+
+        let scene = &mut self.next_frame.scene;
+        let id = scene.push_capture(bounds, captured);
+        scene.insert_primitive(EffectQuad {
+            order: 0,
+            effect_id: effect.effect,
+            source: Some(id),
+            bounds,
+            content_mask: content_mask.scale(scale_factor),
+            corner_radii: effect.corner_radii.scale(scale_factor),
+            scale: scale_factor,
+            opacity,
+            params: effect.params,
+        });
+        result
     }
 
     /// Paint one or more quads into the scene for the next frame at the current stacking context.

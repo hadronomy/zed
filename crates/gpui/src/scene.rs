@@ -29,6 +29,7 @@ pub(crate) struct Scene {
     pub(crate) shadows: Vec<Shadow>,
     pub(crate) quads: Vec<Quad>,
     pub(crate) effects: Vec<EffectQuad>,
+    pub(crate) captures: Vec<Capture>,
     pub(crate) paths: Vec<Path<ScaledPixels>>,
     pub(crate) underlines: Vec<Underline>,
     pub(crate) monochrome_sprites: Vec<MonochromeSprite>,
@@ -45,6 +46,7 @@ impl Scene {
         self.shadows.clear();
         self.quads.clear();
         self.effects.clear();
+        self.captures.clear();
         self.underlines.clear();
         self.monochrome_sprites.clear();
         self.polychrome_sprites.clear();
@@ -65,6 +67,14 @@ impl Scene {
     pub fn pop_layer(&mut self) {
         self.layer_stack.pop();
         self.paint_operations.push(PaintOperation::EndLayer);
+    }
+
+    /// Record a subtree's scene and return the handle an effect composites it
+    /// with.
+    pub fn push_capture(&mut self, bounds: Bounds<ScaledPixels>, scene: Scene) -> CaptureId {
+        let id = CaptureId(self.captures.len() as u32);
+        self.captures.push(Capture { id, bounds, scene });
+        id
     }
 
     pub fn insert_primitive(&mut self, primitive: impl Into<Primitive>) {
@@ -515,10 +525,32 @@ pub(crate) struct Quad {
     pub border_widths: Edges<ScaledPixels>,
 }
 
+/// A subtree painted into its own scene so an effect can be applied to the
+/// result.
+///
+/// The nested scene has its own bounds tree, so a capture is a stacking context
+/// in the same way a CSS `filter` is: ordering inside it is independent of the
+/// parent's.
+pub(crate) struct Capture {
+    pub id: CaptureId,
+    /// The element's bounds grown by the effect's outsets, which is the region
+    /// the renderer resolves to a texture.
+    pub bounds: Bounds<ScaledPixels>,
+    pub scene: Scene,
+}
+
+/// Identifies a [`Capture`] within one frame.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Default)]
+#[repr(transparent)]
+pub(crate) struct CaptureId(pub u32);
+
 #[derive(Debug, Clone)]
 pub(crate) struct EffectQuad {
     pub order: DrawOrder,
     pub effect_id: EffectId,
+    /// The capture this composites, or `None` when the effect paints its own
+    /// pixels and samples nothing.
+    pub source: Option<CaptureId>,
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
     pub corner_radii: Corners<ScaledPixels>,

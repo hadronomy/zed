@@ -183,9 +183,19 @@ pub mod slots {
     /// HLSL `cbuffer` register for the globals: `register(b0)`.
     pub const HLSL_GLOBALS_REGISTER: u32 = 0;
     /// HLSL `StructuredBuffer` register for the instances: `register(t1)`.
-    /// Slot 1, because the stock GPUI pipelines keep `t0` for a texture and the
-    /// effect pipelines will want it for the same reason.
+    /// Slot 1, because `t0` holds the source texture.
     pub const HLSL_INSTANCES_REGISTER: u32 = 1;
+
+    /// Bind group holding what the effect is applied to.
+    pub const SOURCE_GROUP: u32 = 1;
+    /// The captured content.
+    pub const SOURCE_TEXTURE: u32 = 0;
+
+    /// Metal texture index for the source.
+    pub const MSL_SOURCE_TEXTURE: u8 = 0;
+
+    /// HLSL register for the source texture: `register(t0)`.
+    pub const HLSL_SOURCE_REGISTER: u32 = 0;
 }
 
 /// Frame-wide data the shader reads. Mirrors `EffectGlobals` in the preamble.
@@ -437,11 +447,8 @@ pub fn translate(def: &EffectDef, target: ShaderTarget) -> Result<String> {
     }
 }
 
-fn resource(binding: u32) -> naga::ResourceBinding {
-    naga::ResourceBinding {
-        group: slots::GROUP,
-        binding,
-    }
+fn resource(group: u32, binding: u32) -> naga::ResourceBinding {
+    naga::ResourceBinding { group, binding }
 }
 
 fn write_msl(
@@ -453,16 +460,23 @@ fn write_msl(
 
     let mut resources = msl::BindingMap::default();
     resources.insert(
-        resource(slots::GLOBALS),
+        resource(slots::GROUP, slots::GLOBALS),
         msl::BindTarget {
             buffer: Some(slots::MSL_GLOBALS_BUFFER),
             ..Default::default()
         },
     );
     resources.insert(
-        resource(slots::INSTANCES),
+        resource(slots::GROUP, slots::INSTANCES),
         msl::BindTarget {
             buffer: Some(slots::MSL_INSTANCES_BUFFER),
+            ..Default::default()
+        },
+    );
+    resources.insert(
+        resource(slots::SOURCE_GROUP, slots::SOURCE_TEXTURE),
+        msl::BindTarget {
+            texture: Some(slots::MSL_SOURCE_TEXTURE),
             ..Default::default()
         },
     );
@@ -498,7 +512,7 @@ fn write_hlsl(
 
     let mut binding_map = hlsl::BindingMap::default();
     binding_map.insert(
-        resource(slots::GLOBALS),
+        resource(slots::GROUP, slots::GLOBALS),
         hlsl::BindTarget {
             space: 0,
             register: slots::HLSL_GLOBALS_REGISTER,
@@ -506,10 +520,18 @@ fn write_hlsl(
         },
     );
     binding_map.insert(
-        resource(slots::INSTANCES),
+        resource(slots::GROUP, slots::INSTANCES),
         hlsl::BindTarget {
             space: 0,
             register: slots::HLSL_INSTANCES_REGISTER,
+            ..Default::default()
+        },
+    );
+    binding_map.insert(
+        resource(slots::SOURCE_GROUP, slots::SOURCE_TEXTURE),
+        hlsl::BindTarget {
+            space: 0,
+            register: slots::HLSL_SOURCE_REGISTER,
             ..Default::default()
         },
     );
