@@ -338,6 +338,9 @@ impl DirectXRenderer {
             self.devices
                 .device_context
                 .OMSetRenderTargets(Some(&self.resources.render_target_view), None);
+            self.devices
+                .device_context
+                .RSSetViewports(Some(&self.resources.viewport));
         }
         self.draw_scene(scene, &captures)?;
         self.present()
@@ -362,50 +365,27 @@ impl DirectXRenderer {
                 self.devices
                     .device_context
                     .OMSetRenderTargets(Some(&target.render_target), None);
+                // The subtree carries window coordinates, so the viewport is
+                // shifted to bring them into a texture holding only its region.
+                // It stays in force until the next target is bound, which is
+                // what makes restoring it unnecessary.
+                self.devices
+                    .device_context
+                    .RSSetViewports(Some(&[D3D11_VIEWPORT {
+                        TopLeftX: -capture.bounds.origin.x.0,
+                        TopLeftY: -capture.bounds.origin.y.0,
+                        Width: self.resources.viewport[0].Width,
+                        Height: self.resources.viewport[0].Height,
+                        MinDepth: 0.0,
+                        MaxDepth: 1.0,
+                    }]));
             }
 
-            // The subtree still carries window coordinates, so the viewport is
-            // shifted to bring them into a texture holding only its region.
-            let frame = self.resources.viewport[0];
-            let shifted = D3D11_VIEWPORT {
-                TopLeftX: -capture.bounds.origin.x.0,
-                TopLeftY: -capture.bounds.origin.y.0,
-                Width: frame.Width,
-                Height: frame.Height,
-                MinDepth: 0.0,
-                MaxDepth: 1.0,
-            };
-            self.with_viewport(shifted, |renderer| {
-                renderer.draw_scene(&capture.scene, &nested)
-            })?;
+            self.draw_scene(&capture.scene, &nested)?;
 
             resolved.push(index);
         }
         Ok(resolved)
-    }
-
-    /// Run `pass` with `viewport` in force, and put the previous one back
-    /// however `pass` returns.
-    ///
-    /// Every draw call in this renderer re-applies `resources.viewport`, so a
-    /// pass needing a different one installs it here rather than threading it
-    /// through each call site. Restoring on the error path is the whole reason
-    /// this is a function: a shifted viewport left in force would offset every
-    /// element drawn after it, for the rest of the frame.
-    ///
-    /// A panic still skips the restore. A `Drop` guard would cover that, but it
-    /// would have to hold the renderer mutably and so could not lend it to
-    /// `pass`; a panic here is fatal to the frame regardless.
-    fn with_viewport<R>(
-        &mut self,
-        viewport: D3D11_VIEWPORT,
-        pass: impl FnOnce(&mut Self) -> R,
-    ) -> R {
-        let previous = self.resources.viewport;
-        self.resources.viewport = [viewport];
-        let result = pass(self);
-        self.resources.viewport = previous;
-        result
     }
 
     /// Index of a target of this size, creating one if the pool has none.
@@ -524,7 +504,6 @@ impl DirectXRenderer {
         )?;
         self.pipelines.shadow_pipeline.draw(
             &self.devices.device_context,
-            &self.resources.viewport,
             &self.globals.global_params_buffer,
             D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP,
             4,
@@ -543,7 +522,6 @@ impl DirectXRenderer {
         )?;
         self.pipelines.quad_pipeline.draw(
             &self.devices.device_context,
-            &self.resources.viewport,
             &self.globals.global_params_buffer,
             D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP,
             4,
@@ -589,7 +567,6 @@ impl DirectXRenderer {
         )?;
         self.pipelines.path_rasterization_pipeline.draw(
             &self.devices.device_context,
-            &self.resources.viewport,
             &self.globals.global_params_buffer,
             D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
             vertices.len() as u32,
@@ -651,7 +628,6 @@ impl DirectXRenderer {
         self.pipelines.path_sprite_pipeline.draw_with_texture(
             &self.devices.device_context,
             &self.resources.path_intermediate_srv,
-            &self.resources.viewport,
             &self.globals.global_params_buffer,
             &self.globals.sampler,
             sprites.len() as u32,
@@ -698,7 +674,6 @@ impl DirectXRenderer {
         pipeline.draw_with_texture(
             &self.devices.device_context,
             source,
-            &self.resources.viewport,
             &self.globals.effect_globals_buffer,
             &self.globals.sampler,
             effects.len() as u32,
@@ -779,7 +754,6 @@ impl DirectXRenderer {
         )?;
         self.pipelines.underline_pipeline.draw(
             &self.devices.device_context,
-            &self.resources.viewport,
             &self.globals.global_params_buffer,
             D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP,
             4,
@@ -804,7 +778,6 @@ impl DirectXRenderer {
         self.pipelines.mono_sprites.draw_with_texture(
             &self.devices.device_context,
             &texture_view,
-            &self.resources.viewport,
             &self.globals.global_params_buffer,
             &self.globals.sampler,
             sprites.len() as u32,
@@ -828,7 +801,6 @@ impl DirectXRenderer {
         self.pipelines.poly_sprites.draw_with_texture(
             &self.devices.device_context,
             &texture_view,
-            &self.resources.viewport,
             &self.globals.global_params_buffer,
             &self.globals.sampler,
             sprites.len() as u32,
@@ -1249,7 +1221,6 @@ impl<T> PipelineState<T> {
     fn draw(
         &self,
         device_context: &ID3D11DeviceContext,
-        viewport: &[D3D11_VIEWPORT],
         global_params: &[Option<ID3D11Buffer>],
         topology: D3D_PRIMITIVE_TOPOLOGY,
         vertex_count: u32,
@@ -1259,7 +1230,6 @@ impl<T> PipelineState<T> {
             device_context,
             &self.view,
             topology,
-            viewport,
             &self.vertex,
             &self.fragment,
             global_params,
@@ -1275,7 +1245,6 @@ impl<T> PipelineState<T> {
         &self,
         device_context: &ID3D11DeviceContext,
         texture: &[Option<ID3D11ShaderResourceView>],
-        viewport: &[D3D11_VIEWPORT],
         global_params: &[Option<ID3D11Buffer>],
         sampler: &[Option<ID3D11SamplerState>],
         instance_count: u32,
@@ -1284,7 +1253,6 @@ impl<T> PipelineState<T> {
             device_context,
             &self.view,
             D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP,
-            viewport,
             &self.vertex,
             &self.fragment,
             global_params,
@@ -1723,7 +1691,6 @@ fn set_pipeline_state(
     device_context: &ID3D11DeviceContext,
     buffer_view: &[Option<ID3D11ShaderResourceView>],
     topology: D3D_PRIMITIVE_TOPOLOGY,
-    viewport: &[D3D11_VIEWPORT],
     vertex_shader: &ID3D11VertexShader,
     fragment_shader: &ID3D11PixelShader,
     global_params: &[Option<ID3D11Buffer>],
@@ -1733,7 +1700,6 @@ fn set_pipeline_state(
         device_context.VSSetShaderResources(1, Some(buffer_view));
         device_context.PSSetShaderResources(1, Some(buffer_view));
         device_context.IASetPrimitiveTopology(topology);
-        device_context.RSSetViewports(Some(viewport));
         device_context.VSSetShader(vertex_shader, None);
         device_context.PSSetShader(fragment_shader, None);
         device_context.VSSetConstantBuffers(0, Some(global_params));
