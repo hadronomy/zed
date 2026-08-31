@@ -61,6 +61,20 @@ pub(crate) struct DirectXRenderer {
     capture_targets: Vec<CaptureTarget>,
 }
 
+/// Which target a scene is being drawn into, and the viewport that puts window
+/// coordinates onto it.
+///
+/// Carried through the draw so anything that binds a target of its own — the
+/// path intermediate does — can put the pass back afterwards. Without it, a path
+/// inside a captured subtree rebinds the swap chain and everything after it
+/// lands on the window.
+#[derive(Copy, Clone)]
+struct Pass {
+    /// Index into `capture_targets`, or `None` for the swap chain.
+    target: Option<usize>,
+    viewport: D3D11_VIEWPORT,
+}
+
 /// A texture one capture resolves into, and the two views the renderer needs of
 /// it: one to draw the subtree, one for the effect that composites it.
 struct CaptureTarget {
@@ -333,16 +347,12 @@ impl DirectXRenderer {
         self.pre_draw()?;
         let captures = self.render_captures(scene)?;
 
-        // Back to the swap chain, and to the viewport the frame is measured in.
-        unsafe {
-            self.devices
-                .device_context
-                .OMSetRenderTargets(Some(&self.resources.render_target_view), None);
-            self.devices
-                .device_context
-                .RSSetViewports(Some(&self.resources.viewport));
-        }
-        self.draw_scene(scene, &captures)?;
+        let frame = Pass {
+            target: None,
+            viewport: self.resources.viewport[0],
+        };
+        self.bind(frame);
+        self.draw_scene(scene, &captures, frame)?;
         self.present()
     }
 
@@ -357,35 +367,49 @@ impl DirectXRenderer {
             let nested = self.render_captures(&capture.scene)?;
             let index = self.capture_target(capture.bounds.size)?;
 
+            // The subtree carries window coordinates, so the viewport is
+            // shifted to bring them into a texture holding only its region.
+            let pass = Pass {
+                target: Some(index),
+                viewport: D3D11_VIEWPORT {
+                    TopLeftX: -capture.bounds.origin.x.0,
+                    TopLeftY: -capture.bounds.origin.y.0,
+                    Width: self.resources.viewport[0].Width,
+                    Height: self.resources.viewport[0].Height,
+                    MinDepth: 0.0,
+                    MaxDepth: 1.0,
+                },
+            };
             unsafe {
-                let target = &self.capture_targets[index];
-                self.devices
-                    .device_context
-                    .ClearRenderTargetView(target.render_target[0].as_ref().unwrap(), &[0.0; 4]);
-                self.devices
-                    .device_context
-                    .OMSetRenderTargets(Some(&target.render_target), None);
-                // The subtree carries window coordinates, so the viewport is
-                // shifted to bring them into a texture holding only its region.
-                // It stays in force until the next target is bound, which is
-                // what makes restoring it unnecessary.
-                self.devices
-                    .device_context
-                    .RSSetViewports(Some(&[D3D11_VIEWPORT {
-                        TopLeftX: -capture.bounds.origin.x.0,
-                        TopLeftY: -capture.bounds.origin.y.0,
-                        Width: self.resources.viewport[0].Width,
-                        Height: self.resources.viewport[0].Height,
-                        MinDepth: 0.0,
-                        MaxDepth: 1.0,
-                    }]));
+                self.devices.device_context.ClearRenderTargetView(
+                    self.capture_targets[index].render_target[0]
+                        .as_ref()
+                        .unwrap(),
+                    &[0.0; 4],
+                );
             }
-
-            self.draw_scene(&capture.scene, &nested)?;
+            self.bind(pass);
+            self.draw_scene(&capture.scene, &nested, pass)?;
 
             resolved.push(index);
         }
         Ok(resolved)
+    }
+
+    /// Point the pipeline at a pass's target, with its viewport in force.
+    fn bind(&self, pass: Pass) {
+        unsafe {
+            let view = match pass.target {
+                Some(index) => &self.capture_targets[index].render_target,
+                None => &self.resources.render_target_view,
+            };
+            self.devices
+                .device_context
+                .OMSetRenderTargets(Some(view), None);
+            self.devices
+                .device_context
+                .RSSetViewports(Some(&[pass.viewport]));
+        }
     }
 
     /// Index of a target of this size, creating one if the pool has none.
@@ -417,13 +441,13 @@ impl DirectXRenderer {
         Ok(self.capture_targets.len() - 1)
     }
 
-    fn draw_scene(&mut self, scene: &Scene, captures: &[usize]) -> Result<()> {
+    fn draw_scene(&mut self, scene: &Scene, captures: &[usize], pass: Pass) -> Result<()> {
         for batch in scene.batches() {
             match batch {
                 PrimitiveBatch::Shadows(shadows) => self.draw_shadows(shadows),
                 PrimitiveBatch::Quads(quads) => self.draw_quads(quads),
                 PrimitiveBatch::Paths(paths) => {
-                    self.draw_paths_to_intermediate(paths)?;
+                    self.draw_paths_to_intermediate(paths, pass)?;
                     self.draw_paths_from_intermediate(paths)
                 }
                 PrimitiveBatch::Effects { effect_id, effects } => {
@@ -529,7 +553,7 @@ impl DirectXRenderer {
         )
     }
 
-    fn draw_paths_to_intermediate(&mut self, paths: &[Path<ScaledPixels>]) -> Result<()> {
+    fn draw_paths_to_intermediate(&mut self, paths: &[Path<ScaledPixels>], pass: Pass) -> Result<()> {
         if paths.is_empty() {
             return Ok(());
         }
@@ -546,6 +570,12 @@ impl DirectXRenderer {
             self.devices
                 .device_context
                 .OMSetRenderTargets(Some(&self.resources.path_intermediate_msaa_view), None);
+            // The intermediate is the size of the window and is sampled back by
+            // window position, so it is rasterised with the frame's viewport
+            // even when the pass around it is shifted.
+            self.devices
+                .device_context
+                .RSSetViewports(Some(&self.resources.viewport));
         }
 
         // Collect all vertices and sprites for a single draw call
@@ -582,11 +612,8 @@ impl DirectXRenderer {
                 0,
                 RENDER_TARGET_FORMAT,
             );
-            // Restore main render target
-            self.devices
-                .device_context
-                .OMSetRenderTargets(Some(&self.resources.render_target_view), None);
         }
+        self.bind(pass);
 
         Ok(())
     }
