@@ -5,7 +5,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    effect::{EffectId, EffectInstance, PARAM_COUNT},
+    effect::{EffectId, EffectInstance, Params},
     AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, Edges, Hsla, Pixels,
     Point, Radians, ScaledPixels, Size, bounds_tree::BoundsTree, point,
 };
@@ -570,7 +570,7 @@ pub(crate) struct EffectQuad {
     pub corner_radii: Corners<ScaledPixels>,
     pub scale: f32,
     pub opacity: f32,
-    pub params: [f32; PARAM_COUNT],
+    pub params: Params,
 }
 
 // Unlike its neighbours this is not `#[repr(C)]`: it is never uploaded. The
@@ -597,7 +597,7 @@ impl EffectQuad {
             ],
             self.scale,
             self.opacity,
-            self.params,
+            self.params.raw(),
         )
     }
 }
@@ -1003,7 +1003,7 @@ mod tests {
             corner_radii: Corners::default(),
             scale: 1.,
             opacity: 1.,
-            params: [0.; PARAM_COUNT],
+            params: Params::default(),
         }
     }
 

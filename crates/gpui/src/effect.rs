@@ -35,7 +35,7 @@ use std::sync::{OnceLock, RwLock};
 
 // A trait and a derive of the same name, from one path, as `serde::Serialize`
 // does. `crate::Effect` is already taken by the app's deferred-work enum.
-pub use gpui_macros::Effect;
+pub use gpui_macros::{Effect, ShaderEnum};
 
 use anyhow::{Context as _, Result, anyhow, bail};
 
@@ -90,11 +90,20 @@ pub struct ParameterDef {
     pub kind: ParameterKind,
 }
 
+/// One outcome of a [`ShaderEnum`], as the shader names it.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct Variant {
+    /// The Rust variant's own name. GPUI reshapes it for WGSL.
+    pub name: &'static str,
+    /// What reaches the shader.
+    pub value: u32,
+}
+
 /// What a parameter's generated accessor returns.
 ///
-/// Adding a variant means teaching `accessors` to write it and giving some type
-/// a [`Parameter`] impl that produces it; a kind nothing implements is a kind
-/// no effect can use.
+/// Adding a variant means teaching [`accessors`] to write it and giving some
+/// type a [`Parameter`] impl that produces it; a kind nothing implements is a
+/// kind no effect can use.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum ParameterKind {
     /// One float; the accessor returns `f32`.
@@ -102,27 +111,60 @@ pub enum ParameterKind {
     /// One float holding zero or one; the accessor returns `bool`, so a shader
     /// branches on it rather than comparing a float against a threshold.
     Flag,
-    /// One float holding a small whole number; the accessor returns `u32`, for
-    /// a choice with more than two answers.
-    Index,
     /// Two floats; the accessor returns `vec2<f32>`.
     Point,
     /// Four floats holding an [`crate::Hsla`]; the accessor returns
     /// straight-alpha `vec4<f32>`, converted by the same code that resolves a
     /// quad's background.
     Color,
+    /// One float holding a whole number, with a name for each outcome.
+    ///
+    /// Carries its variants rather than being a bare index, because the bare
+    /// index is what forced a shader to spell the discriminants a second time
+    /// and kept the two spellings agreeing by nothing but a test.
+    Enum(&'static [Variant]),
 }
 
 impl ParameterKind {
     /// How many of [`PARAM_COUNT`] slots this occupies.
     pub const fn slots(self) -> usize {
         match self {
-            ParameterKind::Scalar | ParameterKind::Flag | ParameterKind::Index => 1,
+            ParameterKind::Scalar | ParameterKind::Flag | ParameterKind::Enum(_) => 1,
             ParameterKind::Point => 2,
             ParameterKind::Color => 4,
         }
     }
 }
+
+mod sealed {
+    pub trait Sealed {}
+}
+
+/// The floats one parameter occupies, at a width the ABI allows.
+///
+/// Sealed to one, two and four. Three is missing on purpose: WGSL aligns a
+/// `vec3` to sixteen bytes, so a three-float parameter is a layout trap rather
+/// than a saving.
+pub trait Slots: Copy + sealed::Sealed {
+    /// How many floats this is.
+    const WIDTH: usize;
+    /// The floats, to copy into an instance.
+    fn as_slice(&self) -> &[f32];
+}
+
+macro_rules! slots {
+    ($($width:literal),*) => {$(
+        impl sealed::Sealed for [f32; $width] {}
+        impl Slots for [f32; $width] {
+            const WIDTH: usize = $width;
+
+            fn as_slice(&self) -> &[f32] {
+                self
+            }
+        }
+    )*};
+}
+slots!(1, 2, 4);
 
 /// A type an effect can hold as a parameter.
 ///
@@ -132,68 +174,131 @@ impl ParameterKind {
 /// type a trait-bound error pointing at the field, instead of a shader quietly
 /// reading four floats out of something that was never a colour.
 ///
+/// [`Parameter::slots`] returns its floats rather than filling a slice handed
+/// to it. A parameter cannot then claim four floats and write three, which is
+/// not a rule to be enforced but a state that has nowhere to exist.
+///
 /// A length arrives in the shader as logical pixels, because that is the unit
 /// an effect is written in; multiply by `input.scale` for device pixels.
 ///
-/// ```ignore
-/// enum Axis { Across, Down }
-///
-/// impl Parameter for Axis {
-///     const KIND: ParameterKind = ParameterKind::Flag;
-///     fn write(&self, slots: &mut [f32]) {
-///         slots[0] = matches!(self, Axis::Down) as u8 as f32;
-///     }
-/// }
-/// ```
+/// Derive [`ShaderEnum`] rather than implementing this by hand for an enum.
 pub trait Parameter {
-    /// What the generated accessor returns, and how many slots this occupies.
+    /// What the generated accessor returns.
     const KIND: ParameterKind;
 
-    /// Write into `slots`, which is exactly `KIND.slots()` long.
-    fn write(&self, slots: &mut [f32]);
+    /// The floats this occupies. Its width must be [`ParameterKind::slots`].
+    type Slots: Slots;
+
+    /// This value, as the floats the shader reads.
+    fn slots(&self) -> Self::Slots;
+}
+
+/// A Rust enum a shader can branch on by name.
+///
+/// Derive it. The derive takes the variants and their discriminants from the
+/// enum itself, and GPUI generates a WGSL constant and a predicate for each, so
+/// no number is ever written down twice.
+pub trait ShaderEnum: Copy + 'static {
+    /// Every outcome, in declaration order.
+    const VARIANTS: &'static [Variant];
+
+    /// What reaches the shader.
+    fn discriminant(self) -> u32;
 }
 
 impl Parameter for f32 {
     const KIND: ParameterKind = ParameterKind::Scalar;
+    type Slots = [f32; 1];
 
-    fn write(&self, slots: &mut [f32]) {
-        slots[0] = *self;
+    fn slots(&self) -> Self::Slots {
+        [*self]
     }
 }
 
 impl Parameter for Pixels {
     const KIND: ParameterKind = ParameterKind::Scalar;
+    type Slots = [f32; 1];
 
-    fn write(&self, slots: &mut [f32]) {
-        slots[0] = self.0;
+    fn slots(&self) -> Self::Slots {
+        [self.0]
     }
 }
 
 impl Parameter for bool {
     const KIND: ParameterKind = ParameterKind::Flag;
+    type Slots = [f32; 1];
 
-    fn write(&self, slots: &mut [f32]) {
-        slots[0] = *self as u8 as f32;
+    fn slots(&self) -> Self::Slots {
+        [*self as u8 as f32]
     }
 }
 
 impl Parameter for Point<Pixels> {
     const KIND: ParameterKind = ParameterKind::Point;
+    type Slots = [f32; 2];
 
-    fn write(&self, slots: &mut [f32]) {
-        slots[0] = self.x.0;
-        slots[1] = self.y.0;
+    fn slots(&self) -> Self::Slots {
+        [self.x.0, self.y.0]
     }
 }
 
 impl Parameter for Hsla {
     const KIND: ParameterKind = ParameterKind::Color;
+    type Slots = [f32; 4];
 
-    fn write(&self, slots: &mut [f32]) {
-        slots[0] = self.h;
-        slots[1] = self.s;
-        slots[2] = self.l;
-        slots[3] = self.a;
+    fn slots(&self) -> Self::Slots {
+        [self.h, self.s, self.l, self.a]
+    }
+}
+
+/// The floats an effect hands its shader.
+///
+/// Opaque on purpose. How many floats an instance carries is the ABI's business
+/// and GPUI's to change; an effect only ever appends its own values in order,
+/// which is what keeps [`PARAM_COUNT`] out of every effect's signature.
+#[derive(Copy, Clone, Debug)]
+pub struct Params {
+    slots: [f32; PARAM_COUNT],
+    at: usize,
+}
+
+impl Default for Params {
+    fn default() -> Self {
+        Self {
+            slots: [0.0; PARAM_COUNT],
+            at: 0,
+        }
+    }
+}
+
+impl Params {
+    /// Everything an effect writes, in the order it writes it.
+    pub fn of<E: Effect + ?Sized>(effect: &E) -> Self {
+        let mut params = Self::default();
+        effect.write(&mut params);
+        params
+    }
+
+    /// Append one value. What the derive calls, once per field.
+    pub fn put<P: Parameter>(&mut self, value: &P) {
+        let slots = value.slots();
+        let width = <P::Slots as Slots>::WIDTH;
+        debug_assert_eq!(
+            width,
+            P::KIND.slots(),
+            "a parameter's kind and its slots disagree about width"
+        );
+        self.slots[self.at..self.at + width].copy_from_slice(slots.as_slice());
+        self.at += width;
+    }
+
+    /// One slot, by index. For tests that check packing order.
+    pub fn slot(&self, index: usize) -> f32 {
+        self.slots[index]
+    }
+
+    pub(crate) fn raw(&self) -> [f32; PARAM_COUNT] {
+        self.slots
     }
 }
 
@@ -223,8 +328,11 @@ pub trait Effect: 'static {
     /// The values the shader reads, in the order [`Effect::params`] writes.
     const PARAMETERS: &'static [ParameterDef];
 
-    /// The floats the shader reads, in [`Effect::PARAMETERS`] order.
-    fn params(&self) -> [f32; PARAM_COUNT];
+    /// Append every value, in [`Effect::PARAMETERS`] order.
+    ///
+    /// The derive writes this. `Params` is opaque, so an effect states what it
+    /// has rather than how wide an instance is.
+    fn write(&self, out: &mut Params);
 
     /// The registry entry for this effect.
     fn definition() -> EffectDef {
@@ -505,12 +613,38 @@ fn accessors(def: &EffectDef) -> String {
             ParameterKind::Flag => source.push_str(&format!(
                 "fn {name}(input: EffectInput) -> bool {{ return param(input, {slot}u) > 0.5; }}\n"
             )),
+            // A constant and a predicate per variant, emitted whether or not
+            // the shader mentions each one. Emitting only what a shader
+            // references would mean reading the shader to decide, which is the
+            // string-matching this design exists to delete — and renaming a
+            // variant would then silently stop emitting rather than failing to
+            // translate. `fxc_accepts_a_variant_the_shader_never_names` holds
+            // Shader Model 5.0 to accepting the unused ones.
+            //
             // Rounded rather than truncated: the value made a round trip
             // through an f32, and 2.0 can arrive as 1.9999999.
-            ParameterKind::Index => source.push_str(&format!(
-                "fn {name}(input: EffectInput) -> u32 {{ \
-                 return u32(round(max(param(input, {slot}u), 0.0))); }}\n"
-            )),
+            ParameterKind::Enum(variants) => {
+                for variant in variants {
+                    source.push_str(&format!(
+                        "const {}_{}: u32 = {}u;\n",
+                        screaming(name),
+                        screaming(variant.name),
+                        variant.value,
+                    ));
+                }
+                source.push_str(&format!(
+                    "fn {name}(input: EffectInput) -> u32 {{ \
+                     return u32(round(max(param(input, {slot}u), 0.0))); }}\n"
+                ));
+                for variant in variants {
+                    source.push_str(&format!(
+                        "fn {name}_is_{}(input: EffectInput) -> bool {{ return {name}(input) == {}_{}; }}\n",
+                        snake(variant.name),
+                        screaming(name),
+                        screaming(variant.name),
+                    ));
+                }
+            }
             ParameterKind::Point => source.push_str(&format!(
                 "fn {name}(input: EffectInput) -> vec2<f32> {{ \
                  return vec2<f32>(param(input, {slot}u), param(input, {y}u)); }}\n",
@@ -528,6 +662,23 @@ fn accessors(def: &EffectDef) -> String {
         slot += parameter.kind.slots();
     }
     source
+}
+
+/// `Across` becomes `ACROSS`, for a WGSL constant.
+fn screaming(name: &str) -> String {
+    let mut out = String::with_capacity(name.len() + 4);
+    for (index, character) in name.char_indices() {
+        if character.is_ascii_uppercase() && index > 0 {
+            out.push('_');
+        }
+        out.push(character.to_ascii_uppercase());
+    }
+    out
+}
+
+/// `Across` becomes `across`, for a WGSL predicate.
+fn snake(name: &str) -> String {
+    screaming(name).to_ascii_lowercase()
 }
 
 /// How many of the sixteen slots a definition's parameters occupy.
@@ -965,19 +1116,25 @@ mod tests {
         );
     }
 
+    const MODES: &[Variant] = &[
+        Variant { name: "Never", value: 0 },
+        Variant { name: "HalfOpen", value: 1 },
+        Variant { name: "Open", value: 2 },
+    ];
+
     /// Every kind, so a new one cannot be added without a shader that uses it.
     const EVERY_KIND: EffectDef = EffectDef {
         name: "gpui-abi-every-kind",
         wgsl: "fn effect(input: EffectInput) -> vec4<f32> {
                    var out = vec4<f32>(depth(input));
                    if lit(input) { out += tint(input); }
-                   if mode(input) == 2u { out += vec4<f32>(centre(input), 0.0, 0.0); }
+                   if mode_is_open(input) { out += vec4<f32>(centre(input), 0.0, 0.0); }
                    return out;
                }",
         parameters: &[
             ParameterDef { name: "depth", kind: ParameterKind::Scalar },
             ParameterDef { name: "lit", kind: ParameterKind::Flag },
-            ParameterDef { name: "mode", kind: ParameterKind::Index },
+            ParameterDef { name: "mode", kind: ParameterKind::Enum(MODES) },
             ParameterDef { name: "centre", kind: ParameterKind::Point },
             ParameterDef { name: "tint", kind: ParameterKind::Color },
         ],
@@ -1033,11 +1190,8 @@ mod tests {
 
     #[test]
     fn a_flag_reaches_the_shader_as_zero_or_one() {
-        let mut slots = [7.0; 1];
-        Parameter::write(&true, &mut slots);
-        assert_eq!(slots[0], 1.0);
-        Parameter::write(&false, &mut slots);
-        assert_eq!(slots[0], 0.0);
+        assert_eq!(true.slots(), [1.0]);
+        assert_eq!(false.slots(), [0.0]);
     }
 
     #[test]
@@ -1045,29 +1199,28 @@ mod tests {
         // Not device pixels: an effect multiplies by `input.scale` itself, and
         // a value already scaled would be squared on a retina display — which
         // looks plausible, so nothing else would catch it.
-        let mut slots = [0.0; 1];
-        Parameter::write(&crate::px(12.0), &mut slots);
-        assert_eq!(slots[0], 12.0);
+        assert_eq!(crate::px(12.0).slots(), [12.0]);
     }
 
     #[test]
     fn a_point_writes_x_then_y() {
-        let mut slots = [0.0; 2];
-        Parameter::write(&crate::point(crate::px(3.0), crate::px(4.0)), &mut slots);
-        assert_eq!(slots, [3.0, 4.0]);
+        assert_eq!(
+            crate::point(crate::px(3.0), crate::px(4.0)).slots(),
+            [3.0, 4.0]
+        );
     }
 
     #[test]
-    fn every_kind_claims_the_width_it_writes() {
-        // `write` is handed a slice cut to `KIND.slots()`, so a kind that
-        // understates its width panics and one that overstates it leaves a gap
-        // the next parameter never sees.
-        fn check<P: Parameter>(value: P) {
-            let mut slots = vec![f32::NAN; P::KIND.slots()];
-            value.write(&mut slots);
-            assert!(
-                slots.iter().all(|slot| !slot.is_nan()),
-                "{:?} left a slot unwritten",
+    fn every_kind_occupies_the_width_it_claims() {
+        // `slots` returns an array rather than filling one, so a parameter
+        // cannot write fewer floats than it claims — there is no partially
+        // filled state to be in. What is left to check is that the type's own
+        // two statements about its width agree.
+        fn check<P: Parameter>(_: P) {
+            assert_eq!(
+                P::KIND.slots(),
+                <P::Slots as Slots>::WIDTH,
+                "{:?} disagrees with its slots",
                 P::KIND
             );
         }
@@ -1076,6 +1229,33 @@ mod tests {
         check(crate::px(1.0));
         check(crate::point(crate::px(1.0), crate::px(2.0)));
         check(crate::red());
+    }
+
+    #[test]
+    fn an_enum_gets_a_constant_and_a_predicate_for_every_variant() {
+        // Emitted whether or not the shader mentions each one, so that renaming
+        // a variant fails translation with the name in the message rather than
+        // quietly ceasing to emit.
+        let wgsl = accessors(&EVERY_KIND);
+        for (constant, predicate) in [
+            ("MODE_NEVER", "mode_is_never"),
+            ("MODE_HALF_OPEN", "mode_is_half_open"),
+            ("MODE_OPEN", "mode_is_open"),
+        ] {
+            assert!(wgsl.contains(constant), "no `{constant}`:\n{wgsl}");
+            assert!(wgsl.contains(predicate), "no `{predicate}`:\n{wgsl}");
+        }
+    }
+
+    #[test]
+    fn a_constant_carries_the_discriminant_the_rust_side_gave_it() {
+        let wgsl = accessors(&EVERY_KIND);
+        for (name, value) in [("NEVER", 0), ("HALF_OPEN", 1), ("OPEN", 2)] {
+            assert!(
+                wgsl.contains(&format!("const MODE_{name}: u32 = {value}u;")),
+                "`MODE_{name}` is not {value}:\n{wgsl}"
+            );
+        }
     }
 
     #[test]

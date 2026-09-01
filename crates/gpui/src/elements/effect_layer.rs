@@ -1,7 +1,7 @@
 use crate::{
     AnyElement, App, Bounds, Corners, Element, ElementId, GlobalElementId, InspectorElementId,
     IntoElement, LayoutId, PaintEffect, Pixels, Window,
-    effect::{self, EffectId, PARAM_COUNT},
+    effect::{self, EffectId},
 };
 
 /// Wrap `child` so an effect is applied to what it draws.
@@ -13,7 +13,7 @@ use crate::{
 pub fn effect_layer<E: effect::Effect>(effect: &E, child: impl IntoElement) -> EffectLayer {
     EffectLayer {
         effect: effect::register(E::definition()),
-        params: effect.params(),
+        params: effect::Params::of(effect),
         outset: Pixels::ZERO,
         corner_radii: Corners::default(),
         child: child.into_any_element(),
@@ -23,7 +23,7 @@ pub fn effect_layer<E: effect::Effect>(effect: &E, child: impl IntoElement) -> E
 /// An element that applies an effect to its child. See [`effect_layer`].
 pub struct EffectLayer {
     effect: EffectId,
-    params: [f32; PARAM_COUNT],
+    params: effect::Params,
     outset: Pixels,
     corner_radii: Corners<Pixels>,
     child: AnyElement,

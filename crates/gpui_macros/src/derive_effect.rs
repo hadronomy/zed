@@ -46,6 +46,7 @@ pub fn derive_effect(input: TokenStream) -> TokenStream {
     let mut declarations = Vec::new();
     let mut writes = Vec::new();
     let mut widths = Vec::new();
+    let mut agreements = Vec::new();
     for field in &fields.named {
         let Some(identifier) = &field.ident else {
             continue;
@@ -59,19 +60,29 @@ pub fn derive_effect(input: TokenStream) -> TokenStream {
                 kind: <#ty as gpui::effect::Parameter>::KIND,
             }
         });
-        writes.push(quote! {
-            {
-                let width = <#ty as gpui::effect::Parameter>::KIND.slots();
-                gpui::effect::Parameter::write(&self.#identifier, &mut params[at..at + width]);
-                at += width;
-            }
-        });
+        writes.push(quote! { out.put(&self.#identifier); });
         widths.push(quote! {
             <#ty as gpui::effect::Parameter>::KIND.slots()
+        });
+        // A parameter that claims one width and occupies another shifts every
+        // field after it, which reads as an effect ignoring its own settings.
+        // Checked per field with a concrete type, so the message names it.
+        agreements.push(quote! {
+            const _: () = assert!(
+                <#ty as gpui::effect::Parameter>::KIND.slots()
+                    == <<#ty as gpui::effect::Parameter>::Slots as gpui::effect::Slots>::WIDTH,
+                concat!(
+                    "parameter `",
+                    stringify!(#identifier),
+                    "` occupies a different number of slots than its kind claims",
+                ),
+            );
         });
     }
 
     quote! {
+        #(#agreements)*
+
         // The budget is fixed and every width is a constant, so overrunning it
         // is something the compiler can know. Left to `translate`, the same
         // mistake is an effect that registers, fails at startup and draws
@@ -94,12 +105,8 @@ pub fn derive_effect(input: TokenStream) -> TokenStream {
             const SOURCE: &'static str = include_str!(#source);
             const PARAMETERS: &'static [gpui::effect::ParameterDef] = &[#(#declarations),*];
 
-            fn params(&self) -> [f32; gpui::effect::PARAM_COUNT] {
-                let mut params = [0.0; gpui::effect::PARAM_COUNT];
-                let mut at = 0usize;
+            fn write(&self, out: &mut gpui::effect::Params) {
                 #(#writes)*
-                let _ = at;
-                params
             }
         }
     }

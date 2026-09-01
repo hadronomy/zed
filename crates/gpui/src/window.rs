@@ -1,7 +1,7 @@
 #[cfg(any(feature = "inspector", debug_assertions))]
 use crate::Inspector;
 use crate::{
-    effect::{self, EffectId, PARAM_COUNT},
+    effect::{self, EffectId},
     scene::EffectQuad,
     Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
     AsyncWindowContext, AvailableSpace, Background, BorderStyle, Bounds, BoxShadow, Capslock,
@@ -5106,8 +5106,8 @@ pub struct PaintEffect {
     pub corner_radii: Corners<Pixels>,
     /// The registered effect whose fragment function colours these bounds.
     pub effect: EffectId,
-    /// The floats the shader reads through its generated accessors.
-    pub params: [f32; PARAM_COUNT],
+    /// The values the shader reads through its generated accessors.
+    pub params: effect::Params,
 }
 
 impl PaintEffect {
@@ -5119,7 +5119,7 @@ impl PaintEffect {
             outset: Pixels::ZERO,
             corner_radii: Corners::default(),
             effect: effect::register(E::definition()),
-            params: effect.params(),
+            params: effect::Params::of(effect),
         }
     }
 

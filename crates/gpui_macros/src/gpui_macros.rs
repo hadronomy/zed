@@ -1,6 +1,7 @@
 mod derive_action;
 mod derive_app_context;
 mod derive_effect;
+mod derive_shader_enum;
 mod derive_into_element;
 mod derive_render;
 mod derive_visual_context;
@@ -41,6 +42,14 @@ pub fn derive_into_element(input: TokenStream) -> TokenStream {
 #[proc_macro_derive(Effect, attributes(effect))]
 pub fn derive_effect(input: TokenStream) -> TokenStream {
     derive_effect::derive_effect(input)
+}
+
+/// `ShaderEnum` derive macro - see the trait documentation for details. Takes
+/// the variants and their discriminants from the enum, so the constants and
+/// predicates a shader branches on are generated from the one declaration.
+#[proc_macro_derive(ShaderEnum)]
+pub fn derive_shader_enum(input: TokenStream) -> TokenStream {
+    derive_shader_enum::derive_shader_enum(input)
 }
 
 #[proc_macro_derive(Render)]
