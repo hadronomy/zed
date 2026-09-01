@@ -24,7 +24,6 @@ use windows::Win32::Graphics::Direct3D::{D3D_FEATURE_LEVEL_11_0, ID3DBlob};
 use windows::core::PCSTR;
 
 use crate::{
-    CaptureId,
     effect::{self, EffectGlobals, EffectId, EffectInstance},
     platform::windows::directx_renderer::shader_resources::{
         RawShaderBytes, ShaderModule, ShaderTarget,
