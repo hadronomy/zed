@@ -404,7 +404,14 @@ impl<'a> Iterator for BatchIterator<'a> {
                 // `?` rather than the neighbours' `unwrap`: the kind was chosen
                 // because this iterator peeked `Some`, so ending iteration here
                 // is both impossible and the right answer if it ever happens.
-                let effect_id = self.effects_iter.peek()?.effect_id;
+                let first = self.effects_iter.peek()?;
+                let effect_id = first.effect_id;
+                // Broken on the capture as well as the effect, because one
+                // texture is bound for the whole batch. Two quads of one effect
+                // at one order reading different captures is not exotic — it is
+                // what two cards of the same kind on a page look like — and
+                // without this they all read whichever capture came first.
+                let source = first.source;
                 let effects_start = self.effects_start;
                 let mut effects_end = effects_start + 1;
                 self.effects_iter.next();
@@ -413,6 +420,7 @@ impl<'a> Iterator for BatchIterator<'a> {
                     .next_if(|effect| {
                         (effect.order, batch_kind) < max_order_and_kind
                             && effect.effect_id == effect_id
+                            && effect.source == source
                     })
                     .is_some()
                 {
@@ -421,6 +429,7 @@ impl<'a> Iterator for BatchIterator<'a> {
                 self.effects_start = effects_end;
                 Some(PrimitiveBatch::Effects {
                     effect_id,
+                    source,
                     effects: &self.effects[effects_start..effects_end],
                 })
             }
@@ -499,6 +508,10 @@ pub(crate) enum PrimitiveBatch<'a> {
     Quads(&'a [Quad]),
     Effects {
         effect_id: EffectId,
+        /// The capture every quad in this batch reads, bound once for the
+        /// batch. Carried here rather than read back off the first quad, so the
+        /// invariant the renderers rely on is the one the iterator enforces.
+        source: Option<CaptureId>,
         effects: &'a [EffectQuad],
     },
     Paths(&'a [Path<ScaledPixels>]),
@@ -963,5 +976,83 @@ impl PathVertex<Pixels> {
             st_position: self.st_position,
             content_mask: self.content_mask.scale(factor),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{point, size};
+
+    fn effect_quad(x: f32, source: Option<CaptureId>) -> EffectQuad {
+        let bounds = Bounds {
+            origin: point(ScaledPixels(x), ScaledPixels(0.)),
+            size: size(ScaledPixels(10.), ScaledPixels(10.)),
+        };
+        EffectQuad {
+            order: 0,
+            effect_id: EffectId(0),
+            source,
+            bounds,
+            content_mask: ContentMask {
+                bounds: Bounds {
+                    origin: point(ScaledPixels(0.), ScaledPixels(0.)),
+                    size: size(ScaledPixels(1000.), ScaledPixels(1000.)),
+                },
+            },
+            corner_radii: Corners::default(),
+            scale: 1.,
+            opacity: 1.,
+            params: [0.; PARAM_COUNT],
+        }
+    }
+
+    fn effect_batches(scene: &Scene) -> Vec<Option<CaptureId>> {
+        scene
+            .batches()
+            .filter_map(|batch| match batch {
+                PrimitiveBatch::Effects { source, .. } => Some(source),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn two_captures_of_one_effect_do_not_share_a_batch() {
+        // One texture is bound per batch, so a batch spanning two captures
+        // paints the first one's content twice. Two cards of the same kind on a
+        // page is the ordinary case, not an exotic one — and it looks like the
+        // effect working, on the wrong pixels.
+        let mut scene = Scene::default();
+        scene.insert_primitive(effect_quad(0., Some(CaptureId(0))));
+        scene.insert_primitive(effect_quad(100., Some(CaptureId(1))));
+        scene.finish();
+
+        assert_eq!(
+            effect_batches(&scene),
+            vec![Some(CaptureId(0)), Some(CaptureId(1))]
+        );
+    }
+
+    #[test]
+    fn one_capture_across_several_quads_still_binds_once() {
+        // The split is on the capture, not on the quad: quads that do share a
+        // capture must stay in one batch, or the bind-once saving is gone.
+        let mut scene = Scene::default();
+        scene.insert_primitive(effect_quad(0., Some(CaptureId(0))));
+        scene.insert_primitive(effect_quad(100., Some(CaptureId(0))));
+        scene.finish();
+
+        assert_eq!(effect_batches(&scene), vec![Some(CaptureId(0))]);
+    }
+
+    #[test]
+    fn an_effect_that_samples_nothing_batches_with_its_own_kind() {
+        let mut scene = Scene::default();
+        scene.insert_primitive(effect_quad(0., None));
+        scene.insert_primitive(effect_quad(100., None));
+        scene.finish();
+
+        assert_eq!(effect_batches(&scene), vec![None]);
     }
 }

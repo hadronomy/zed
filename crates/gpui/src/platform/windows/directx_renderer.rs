@@ -24,11 +24,12 @@ use windows::Win32::Graphics::Direct3D::{D3D_FEATURE_LEVEL_11_0, ID3DBlob};
 use windows::core::PCSTR;
 
 use crate::{
+    CaptureId,
     effect::{self, EffectGlobals, EffectId, EffectInstance},
     platform::windows::directx_renderer::shader_resources::{
         RawShaderBytes, ShaderModule, ShaderTarget,
     },
-    scene::EffectQuad,
+    scene::{CaptureId, EffectQuad},
     *,
 };
 
@@ -80,6 +81,13 @@ struct Pass {
 struct CaptureTarget {
     width: u32,
     height: u32,
+    /// Whether a capture in the frame being drawn is still going to be read
+    /// from this. Handing it to a second capture while that is true does not
+    /// merely show the wrong picture: the second pass draws into a texture that
+    /// is bound as its own source, and Direct3D resolves that read-write hazard
+    /// by silently unbinding the view, so the pass samples nothing and the
+    /// composite draws nothing.
+    claimed: bool,
     render_target: [Option<ID3D11RenderTargetView>; 1],
     shader_resource: [Option<ID3D11ShaderResourceView>; 1],
 }
@@ -352,7 +360,13 @@ impl DirectXRenderer {
             viewport: self.resources.viewport[0],
         };
         self.bind(frame);
-        self.draw_scene(scene, &captures, frame)?;
+        let drawn = self.draw_scene(scene, &captures, frame);
+        // Released here rather than on the way in, so a failed draw cannot
+        // leave the pool looking free while its textures are still bound.
+        for target in &mut self.capture_targets {
+            target.claimed = false;
+        }
+        drawn?;
         self.present()
     }
 
@@ -412,15 +426,20 @@ impl DirectXRenderer {
         }
     }
 
-    /// Index of a target of this size, creating one if the pool has none.
+    /// Index of a free target of this size, creating one if the pool has none.
+    ///
+    /// Claimed until the frame is drawn, which is what Metal gets for free by
+    /// taking the texture out of its pool and only returning it when the frame
+    /// retires. Sizes repeat constantly — sibling cards, and the two passes of
+    /// a separable blur — so matching on size alone hands one texture to two
+    /// live captures.
     fn capture_target(&mut self, size: Size<ScaledPixels>) -> Result<usize> {
         let width = (size.width.0.ceil() as u32).max(1);
         let height = (size.height.0.ceil() as u32).max(1);
-        if let Some(index) = self
-            .capture_targets
-            .iter()
-            .position(|target| target.width == width && target.height == height)
-        {
+        if let Some(index) = self.capture_targets.iter().position(|target| {
+            !target.claimed && target.width == width && target.height == height
+        }) {
+            self.capture_targets[index].claimed = true;
             return Ok(index);
         }
 
@@ -435,6 +454,7 @@ impl DirectXRenderer {
         self.capture_targets.push(CaptureTarget {
             width,
             height,
+            claimed: true,
             render_target: [render_target],
             shader_resource,
         });
@@ -450,9 +470,11 @@ impl DirectXRenderer {
                     self.draw_paths_to_intermediate(paths, pass)?;
                     self.draw_paths_from_intermediate(paths)
                 }
-                PrimitiveBatch::Effects { effect_id, effects } => {
-                    self.draw_effects(effect_id, effects, captures)
-                }
+                PrimitiveBatch::Effects {
+                    effect_id,
+                    source,
+                    effects,
+                } => self.draw_effects(effect_id, source, effects, captures),
                 PrimitiveBatch::Underlines(underlines) => self.draw_underlines(underlines),
                 PrimitiveBatch::MonochromeSprites {
                     texture_id,
@@ -664,6 +686,7 @@ impl DirectXRenderer {
     fn draw_effects(
         &mut self,
         effect_id: EffectId,
+        source: Option<CaptureId>,
         effects: &[EffectQuad],
         captures: &[usize],
     ) -> Result<()> {
@@ -688,12 +711,10 @@ impl DirectXRenderer {
             &self.devices.device_context,
             &self.effect_instances,
         )?;
-        // One batch is one effect at one draw order, so every quad in it reads
-        // the same capture. Without a capture the blank keeps `source()` from
-        // returning whichever resource was bound last.
-        let source = effects
-            .first()
-            .and_then(|effect| effect.source)
+        // The batch was cut so every quad in it reads this one capture, which is
+        // why binding once is sound. Without a capture the blank keeps
+        // `source()` from returning whichever resource was bound last.
+        let source = source
             .and_then(|id| captures.get(id.0 as usize))
             .map_or(&self.globals.blank_view, |index| {
                 &self.capture_targets[*index].shader_resource

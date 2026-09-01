@@ -5,7 +5,7 @@ use crate::{
     Surface, Underline,
     effect::{self, EffectGlobals, EffectId, EffectInstance, ShaderTarget},
     point,
-    scene::EffectQuad,
+    scene::{CaptureId, EffectQuad},
     size,
 };
 use anyhow::Result;
@@ -618,8 +618,13 @@ impl MetalRenderer {
                     viewport_size,
                     command_encoder,
                 ),
-                PrimitiveBatch::Effects { effect_id, effects } => self.draw_effects(
+                PrimitiveBatch::Effects {
                     effect_id,
+                    source,
+                    effects,
+                } => self.draw_effects(
+                    effect_id,
+                    source,
                     effects,
                     captures,
                     instance_buffer,
@@ -911,6 +916,7 @@ impl MetalRenderer {
     fn draw_effects(
         &self,
         effect_id: EffectId,
+        source: Option<CaptureId>,
         effects: &[EffectQuad],
         captures: &[metal::Texture],
         instance_buffer: &mut InstanceBuffer,
@@ -930,11 +936,9 @@ impl MetalRenderer {
 
         command_encoder.set_render_pipeline_state(&pipeline_state);
 
-        // One batch is one effect at one draw order, so every quad in it reads
-        // the same capture and the texture binds once.
-        let source = effects
-            .first()
-            .and_then(|effect| effect.source)
+        // The batch was cut so every quad in it reads this one capture, which is
+        // why the texture binds once for the whole batch.
+        let source = source
             .and_then(|id| captures.get(id.0 as usize))
             .map_or(&*self.blank_texture, |texture| &**texture);
         command_encoder.set_fragment_texture(effect::slots::MSL_SOURCE_TEXTURE as u64, Some(source));

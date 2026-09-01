@@ -677,7 +677,7 @@ impl BladeRenderer {
         profiling::scope!("render pass");
         for batch in scene.batches() {
             match batch {
-                PrimitiveBatch::Effects { effect_id, effects } => {
+                PrimitiveBatch::Effects { effect_id, effects, .. } => {
                     // Blade builds its pipelines from one shader at startup,
                     // while an effect's WGSL is registered by the application
                     // and must be compiled per effect. Until that is wired the
