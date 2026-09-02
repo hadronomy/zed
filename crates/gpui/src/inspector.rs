@@ -147,6 +147,19 @@ mod conditional {
             self.pick_depth = Some(0.0);
         }
 
+        /// Stops element picking mode without selecting anything.
+        ///
+        /// Picking otherwise ends only when the user clicks, and that click is
+        /// spent: while picking is armed, `Window` routes every mouse event to
+        /// the inspector and skips the rest of the window's handling. An
+        /// inspector is created armed, so an application that opens one to
+        /// *read* a panel rather than to pick has no way to stand the picker
+        /// down, and the next click anywhere is consumed selecting whatever
+        /// happened to be under it.
+        pub fn stop_picking(&mut self) {
+            self.pick_depth = None;
+        }
+
         /// Returns whether the inspector is currently in picking mode.
         pub fn is_picking(&self) -> bool {
             self.pick_depth.is_some()
