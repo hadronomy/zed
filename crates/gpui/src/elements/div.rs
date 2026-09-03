@@ -1277,6 +1277,14 @@ pub struct DivInspectorState {
     pub bounds: Bounds<Pixels>,
     /// Size of the children of the element, or `bounds.size` if it has no children.
     pub content_size: Size<Pixels>,
+    /// When this element was last laid out.
+    ///
+    /// The inspector keeps the selected element's state until something else is
+    /// selected, and hands it back whether or not the element is still in the
+    /// tree. Nothing else here says which: a static element and one that has
+    /// been removed both report the same bounds forever. This is stamped on
+    /// every prepaint, so a reader can tell "unchanged" from "gone".
+    pub painted: std::time::Instant,
 }
 
 impl Styled for Div {
@@ -1555,6 +1563,7 @@ impl Interactivity {
                         base_style: self.base_style.clone(),
                         bounds: Default::default(),
                         content_size: Default::default(),
+                        painted: std::time::Instant::now(),
                     })
                 }
             },
@@ -1640,6 +1649,7 @@ impl Interactivity {
                 if let Some(inspector_state) = inspector_state {
                     inspector_state.bounds = bounds;
                     inspector_state.content_size = content_size;
+                    inspector_state.painted = std::time::Instant::now();
                 }
             },
         );
