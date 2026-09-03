@@ -666,6 +666,47 @@ pub(crate) struct DeferredDraw {
     paint_range: Range<PaintIndex>,
 }
 
+/// What one frame cost, and what it was made of.
+///
+/// GPUI carries no profiler. Everything a developer needs to answer "why is
+/// this window expensive" is inside `Frame`, which is private, so this is the
+/// read-only window onto it: the two phases of `draw` timed apart, and the
+/// scene counted by kind.
+///
+/// The split matters more than the total. Time in `build` is layout and element
+/// construction — a tree that is too deep, or a view rebuilding work it could
+/// have kept. Time in `paint` is the scene being written — too many primitives,
+/// usually because something is drawn per item that could be drawn once. The
+/// counts say which.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FrameStats {
+    /// Rendering views, laying out, and prepainting.
+    pub build: std::time::Duration,
+    /// Writing the scene.
+    pub paint: std::time::Duration,
+    /// All of `Window::draw`, including the bookkeeping either side.
+    pub total: std::time::Duration,
+    /// Ordered draw operations in the scene.
+    pub operations: usize,
+    pub quads: usize,
+    pub shadows: usize,
+    pub paths: usize,
+    pub underlines: usize,
+    pub monochrome_sprites: usize,
+    pub polychrome_sprites: usize,
+    pub surfaces: usize,
+    /// Effect quads and the captures that feed them.
+    pub effects: usize,
+    pub captures: usize,
+    /// Hitboxes inserted this frame.
+    pub hitboxes: usize,
+    /// Element states carried over from the last frame. A number that only ever
+    /// grows is a leak.
+    pub element_states: usize,
+    /// Elements held back to paint after the tree.
+    pub deferred_draws: usize,
+}
+
 pub(crate) struct Frame {
     pub(crate) focus: Option<FocusId>,
     pub(crate) window_active: bool,
@@ -876,6 +917,7 @@ pub struct Window {
     pub(crate) client_inset: Option<Pixels>,
     #[cfg(any(feature = "inspector", debug_assertions))]
     inspector: Option<Entity<Inspector>>,
+    frame_stats: FrameStats,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1260,6 +1302,7 @@ impl Window {
             image_cache_stack: Vec::new(),
             #[cfg(any(feature = "inspector", debug_assertions))]
             inspector: None,
+            frame_stats: FrameStats::default(),
         })
     }
 
@@ -1914,6 +1957,7 @@ impl Window {
     /// the contents of the new [`Scene`], use [`Self::present`].
     #[profiling::function]
     pub fn draw(&mut self, cx: &mut App) -> ArenaClearNeeded {
+        let draw_started = std::time::Instant::now();
         self.invalidate_entities();
         cx.entities.clear_accessed();
         debug_assert!(self.rendered_entity_stack.is_empty());
@@ -1933,6 +1977,24 @@ impl Window {
             self.platform_window
                 .set_input_handler(input_handler.unwrap());
         }
+
+        // Counted here, while `next_frame` is still the frame that was just
+        // built and before it is swapped out from under us.
+        let scene = &self.next_frame.scene;
+        self.frame_stats.operations = scene.len();
+        self.frame_stats.quads = scene.quads.len();
+        self.frame_stats.shadows = scene.shadows.len();
+        self.frame_stats.paths = scene.paths.len();
+        self.frame_stats.underlines = scene.underlines.len();
+        self.frame_stats.monochrome_sprites = scene.monochrome_sprites.len();
+        self.frame_stats.polychrome_sprites = scene.polychrome_sprites.len();
+        self.frame_stats.surfaces = scene.surfaces.len();
+        self.frame_stats.effects = scene.effects.len();
+        self.frame_stats.captures = scene.captures.len();
+        self.frame_stats.hitboxes = self.next_frame.hitboxes.len();
+        self.frame_stats.element_states = self.next_frame.element_states.len();
+        self.frame_stats.deferred_draws = self.next_frame.deferred_draws.len();
+        self.frame_stats.total = draw_started.elapsed();
 
         self.layout_engine.as_mut().unwrap().clear();
         self.text_system().finish_frame();
@@ -2013,6 +2075,7 @@ impl Window {
     }
 
     fn draw_roots(&mut self, cx: &mut App) {
+        let build_started = std::time::Instant::now();
         self.invalidator.set_phase(DrawPhase::Prepaint);
         self.tooltip_bounds.take();
 
@@ -2067,6 +2130,8 @@ impl Window {
         self.mouse_hit_test = self.next_frame.hit_test(self.mouse_position);
 
         // Now actually paint the elements.
+        self.frame_stats.build = build_started.elapsed();
+        let paint_started = std::time::Instant::now();
         self.invalidator.set_phase(DrawPhase::Paint);
         root_element.paint(self, cx);
 
@@ -2085,6 +2150,8 @@ impl Window {
 
         #[cfg(any(feature = "inspector", debug_assertions))]
         self.paint_inspector_hitbox(cx);
+
+        self.frame_stats.paint = paint_started.elapsed();
     }
 
     fn prepaint_tooltip(&mut self, cx: &mut App) -> Option<AnyElement> {
@@ -4516,6 +4583,14 @@ impl Window {
     pub fn set_tabbing_identifier(&self, tabbing_identifier: Option<String>) {
         self.platform_window
             .set_tabbing_identifier(tabbing_identifier)
+    }
+
+    /// What the last frame cost, and what it was made of.
+    ///
+    /// Read-only, and free: the numbers are collected while the frame is being
+    /// finished either way.
+    pub fn frame_stats(&self) -> FrameStats {
+        self.frame_stats
     }
 
     /// Toggles the inspector mode on this window.
